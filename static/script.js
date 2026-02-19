@@ -9,6 +9,7 @@ let selectedChannel = null;
 let youtubeVideoData = null;
 let activeStreamId = null;
 let statusPollInterval = null;
+let status404Count = 0;
 let iptvChannels = [];
 let iptvGroups = [];
 
@@ -285,6 +286,7 @@ async function stopStream() {
 
 // Status Polling
 function startStatusPolling() {
+    status404Count = 0; // Reset counter
     statusPollInterval = setInterval(pollStatus, 3000);
     pollStatus();
 }
@@ -301,6 +303,23 @@ async function pollStatus() {
 
     try {
         const response = await fetch(`/api/streams/${activeStreamId}/status`);
+
+        // Stream bulunamadıysa (404)
+        if (response.status === 404) {
+            status404Count++;
+            console.warn(`Stream not found (attempt ${status404Count})`);
+            // 10 denemeden sonra yayını durdurulmuş say
+            if (status404Count >= 10) {
+                showNotification('Yayın bağlantısı kesildi', 'error');
+                activeStreamId = null;
+                status404Count = 0;
+                updateUI(false);
+                stopStatusPolling();
+            }
+            return;
+        }
+
+        status404Count = 0; // Reset counter on success
         const data = await response.json();
 
         if (data.success) {

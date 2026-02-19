@@ -96,15 +96,15 @@ class StreamProcess:
         if not HAS_YTDLP:
             self.status = 'error'
             self.log.append("Error: yt-dlp not installed. Cannot stream from YouTube.")
-            return False, "yt-dlp not installed. Please install yt-dlp."
+            return False, "yt-dlp yüklü değil. Sunucuya yt-dlp kurun."
 
         # Get the direct stream URL using yt-dlp
         try:
             self.log.append(f"Fetching stream URL for: {youtube_url}")
             ydl_opts = {
                 'format': 'best[height<=?1080]/best',
-                'quiet': True,
-                'no_warnings': True,
+                'quiet': False,
+                'no_warnings': False,
             }
 
             with yt_dlp.YoutubeDL(ydl_opts) as ydl:
@@ -112,7 +112,7 @@ class StreamProcess:
                 if 'url' not in info:
                     self.status = 'error'
                     self.log.append("Error: Could not get stream URL from YouTube")
-                    return False, "Could not get stream URL from YouTube"
+                    return False, "Stream URL alınamadı"
 
                 stream_url = info['url']
                 video_title = info.get('title', 'YouTube Video')
@@ -120,8 +120,9 @@ class StreamProcess:
 
         except Exception as e:
             self.status = 'error'
-            self.log.append(f"Error fetching YouTube video: {str(e)}")
-            return False, f"Error fetching YouTube video: {str(e)}"
+            error_msg = f"Error fetching YouTube video: {str(e)}"
+            self.log.append(error_msg)
+            return False, error_msg
 
         # Parse quality
         bitrate_map = {
@@ -293,6 +294,7 @@ def start_stream():
 
     if success:
         active_streams[stream_id] = stream
+        save_stream_state(active_streams)
         return jsonify({
             'success': True,
             'stream_id': stream_id,
@@ -305,12 +307,24 @@ def start_stream():
 @app.route('/api/streams/<stream_id>/stop', methods=['POST'])
 def stop_stream(stream_id):
     """Stop a running stream."""
-    if stream_id not in active_streams:
+    stream = active_streams.get(stream_id)
+
+    if not stream:
+        # Check state file for multi-worker support
+        state = load_stream_state()
+        if stream_id in state:
+            del state[stream_id]
+            try:
+                with open(STREAM_STATE_FILE, 'w') as f:
+                    json.dump(state, f)
+            except:
+                pass
+            return jsonify({'success': True, 'message': 'Stream stopped'})
         return jsonify({'success': False, 'error': 'Stream not found'}), 404
 
-    stream = active_streams[stream_id]
     stream.stop()
     del active_streams[stream_id]
+    save_stream_state(active_streams)
 
     return jsonify({'success': True, 'message': 'Stream stopped'})
 
@@ -318,17 +332,30 @@ def stop_stream(stream_id):
 @app.route('/api/streams/<stream_id>/status', methods=['GET'])
 def stream_status(stream_id):
     """Get status of a stream."""
-    if stream_id not in active_streams:
+    stream = active_streams.get(stream_id)
+
+    if not stream:
+        # Try loading from state file for multi-worker support
+        state = load_stream_state()
+        if stream_id in state:
+            stream_state = state[stream_id]
+            return jsonify({
+                'success': True,
+                'status': stream_state.get('status', 'unknown'),
+                'is_running': stream_state.get('is_running', False),
+                'source': stream_state.get('source', ''),
+                'started_at': stream_state.get('started_at'),
+                'log': stream_state.get('log', [])
+            })
         return jsonify({'success': False, 'error': 'Stream not found'}), 404
 
-    stream = active_streams[stream_id]
     return jsonify({
         'success': True,
         'status': stream.status,
         'is_running': stream.is_running(),
         'source': stream.source,
         'started_at': stream.started_at.isoformat() if stream.started_at else None,
-        'log': stream.log[-10:]  # Last 10 log entries
+        'log': stream.log[-10:]
     })
 
 
@@ -423,6 +450,39 @@ iptv_channels = []
 iptv_groups = []
 iptv_playlist_url = None
 
+# Stream state file for multi-worker support
+import json
+import tempfile
+STREAM_STATE_FILE = os.path.join(tempfile.gettempdir(), 'youtubelive_streams.json')
+
+def save_stream_state(streams):
+    """Save stream state to file for sharing between workers."""
+    try:
+        state = {}
+        for stream_id, stream in streams.items():
+            state[stream_id] = {
+                'id': stream_id,
+                'status': stream.status,
+                'source': stream.source,
+                'started_at': stream.started_at.isoformat() if stream.started_at else None,
+                'log': stream.log[-10:],
+                'is_running': stream.is_running()
+            }
+        with open(STREAM_STATE_FILE, 'w') as f:
+            json.dump(state, f)
+    except Exception as e:
+        print(f"Error saving stream state: {e}")
+
+def load_stream_state():
+    """Load stream state from file."""
+    try:
+        if os.path.exists(STREAM_STATE_FILE):
+            with open(STREAM_STATE_FILE, 'r') as f:
+                return json.load(f)
+    except Exception as e:
+        print(f"Error loading stream state: {e}")
+    return {}
+
 
 # ==================== IPTV Endpoints ====================
 
@@ -516,6 +576,7 @@ def iptv_start_stream():
 
     if success:
         active_streams[stream_id] = stream
+        save_stream_state(active_streams)
         return jsonify({
             'success': True,
             'stream_id': stream_id,
@@ -606,6 +667,7 @@ def youtube_start_stream():
 
     if success:
         active_streams[stream_id] = stream
+        save_stream_state(active_streams)
         return jsonify({
             'success': True,
             'stream_id': stream_id,
