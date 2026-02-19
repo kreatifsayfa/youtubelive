@@ -2,11 +2,11 @@
 # Optimized for Dokploy deployment
 
 [phases.setup]
-nixPkgs = ["python3", "ffmpeg-full"]
+nixPkgs = ["python312", "python312Packages.pip", "ffmpeg-full"]
 
 [phases.install]
 cmds = [
-  "python3 -m pip install --no-cache-dir -r requirements.txt"
+  "python3.12 -m pip install --no-cache-dir -r requirements.txt"
 ]
 
 [phases.build]
