@@ -6,8 +6,7 @@ nixPkgs = ["python3", "ffmpeg-full"]
 
 [phases.install]
 cmds = [
-  "pip install --no-cache-dir -r requirements.txt",
-  "pip install gunicorn"
+  "python3 -m pip install --no-cache-dir -r requirements.txt"
 ]
 
 [phases.build]
