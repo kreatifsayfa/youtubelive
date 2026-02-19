@@ -1,0 +1,117 @@
+<!DOCTYPE html>
+<html lang="tr">
+<head>
+    <meta charset="UTF-8">
+    <meta name="viewport" content="width=device-width, initial-scale=1.0">
+    <title>YouTube Live Streamer</title>
+    <link rel="stylesheet" href="/static/style.css">
+</head>
+<body>
+    <div class="container">
+        <header>
+            <h1>YouTube Live Streamer</h1>
+            <p class="subtitle">Canlı yayın yönetim paneli</p>
+        </header>
+
+        <div class="main-content">
+            <!-- YouTube Stream Key Input -->
+            <section class="card">
+                <h2>YouTube Stream Ayarları</h2>
+                <div class="form-group">
+                    <label for="youtubeKey">YouTube Stream Key</label>
+                    <input type="password" id="youtubeKey" placeholder="YouTube Studio'dan alın">
+                    <small>
+                        YouTube Studio > Yarat > Canlı yayın > Stream anahtarı kopyalayın
+                    </small>
+                </div>
+                <div class="form-group">
+                    <label for="quality">Video Kalitesi</label>
+                    <select id="quality">
+                        <option value="720p">720p (HD) - 2.5 Mbps</option>
+                        <option value="1080p" selected>1080p (Full HD) - 4.5 Mbps</option>
+                        <option value="1440p">1440p (2K) - 9 Mbps</option>
+                        <option value="2160p">2160p (4K) - 18 Mbps</option>
+                    </select>
+                </div>
+            </section>
+
+            <!-- Stream Source Tabs -->
+            <section class="card">
+                <div class="tabs">
+                    <button class="tab-btn active" data-tab="m3u8">M3U8 URL</button>
+                    <button class="tab-btn" data-tab="file">Dosya Yükle</button>
+                </div>
+
+                <!-- M3U8 Tab -->
+                <div class="tab-content active" id="m3u8-tab">
+                    <div class="form-group">
+                        <label for="m3u8Url">M3U8 Stream URL</label>
+                        <input type="text" id="m3u8Url" placeholder="https://example.com/stream.m3u8">
+                        <small>İnternetten bir M3U8 stream URL'i girin</small>
+                    </div>
+                </div>
+
+                <!-- File Upload Tab -->
+                <div class="tab-content" id="file-tab">
+                    <div class="upload-area" id="uploadArea">
+                        <svg width="48" height="48" viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="2">
+                            <path d="M21 15v4a2 2 0 0 1-2 2H5a2 2 0 0 1-2-2v-4"></path>
+                            <polyline points="17 8 12 3 7 8"></polyline>
+                            <line x1="12" y1="3" x2="12" y2="15"></line>
+                        </svg>
+                        <p>Dosyayı sürükleyin veya tıklayın</p>
+                        <input type="file" id="fileInput" accept=".mp4,.mkv,.mov,.avi,.flv,.wmv,.webm" hidden>
+                    </div>
+                    <div class="form-group" style="margin-top: 15px;">
+                        <label>
+                            <input type="checkbox" id="loopFile">
+                            Dosyuyu döngü olarak yayınlamak istiyorum
+                        </label>
+                    </div>
+
+                    <!-- Uploaded Files List -->
+                    <div id="uploadedFiles" class="uploaded-files"></div>
+                </div>
+            </section>
+
+            <!-- Action Buttons -->
+            <section class="card actions">
+                <button id="startBtn" class="btn btn-primary" disabled>
+                    <span class="btn-icon">▶</span> Yayını Başlat
+                </button>
+                <button id="stopBtn" class="btn btn-danger" disabled>
+                    <span class="btn-icon">■</span> Yayını Durdur
+                </button>
+            </section>
+
+            <!-- Active Stream Status -->
+            <section class="card" id="streamStatusCard" style="display: none;">
+                <h2>Aktif Yayın</h2>
+                <div class="stream-status" id="streamStatus">
+                    <div class="status-item">
+                        <span class="status-label">Durum:</span>
+                        <span class="status-value" id="statusValue">Başlamadı</span>
+                    </div>
+                    <div class="status-item">
+                        <span class="status-label">Kaynak:</span>
+                        <span class="status-value" id="sourceValue">-</span>
+                    </div>
+                    <div class="status-item">
+                        <span class="status-label">Başlangıç:</span>
+                        <span class="status-value" id="startedAtValue">-</span>
+                    </div>
+                </div>
+                <div class="stream-log" id="streamLog"></div>
+            </section>
+
+            <!-- Active Streams List -->
+            <section class="card" id="streamsListCard" style="display: none;">
+                <h2>Aktif Yayınlar</h2>
+                <div id="streamsList"></div>
+            </section>
+        </div>
+    </div>
+
+    <script src="/static/script.js"></script>
+</body>
+</html>
