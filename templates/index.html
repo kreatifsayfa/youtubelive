@@ -41,6 +41,7 @@
                     <button class="tab-btn active" data-tab="m3u8">M3U8 URL</button>
                     <button class="tab-btn" data-tab="file">Dosya Yükle</button>
                     <button class="tab-btn" data-tab="iptv">IPTV Kanalları</button>
+                    <button class="tab-btn" data-tab="youtube">YouTube</button>
                 </div>
 
                 <!-- M3U8 Tab -->
@@ -103,6 +104,21 @@
                         <div class="selected-channel-card">
                             <h4>Seçili Kanal:</h4>
                             <div id="selectedChannelName" class="selected-channel-name"></div>
+                        </div>
+                    </div>
+                </div>
+
+                <!-- YouTube Tab -->
+                <div class="tab-content" id="youtube-tab">
+                    <div class="form-group">
+                        <label for="youtubeUrl">YouTube Video/Canlı Yayın Linki</label>
+                        <input type="text" id="youtubeUrl" placeholder="https://www.youtube.com/watch?v=...">
+                        <small>YouTube videosu veya canlı yayın linkini girin</small>
+                    </div>
+                    <div id="youtubeVideoInfo" style="display: none; margin-top: 15px;">
+                        <div class="selected-channel-card">
+                            <h4>Video Bilgisi:</h4>
+                            <div id="youtubeVideoTitle" class="selected-channel-name"></div>
                         </div>
                     </div>
                 </div>

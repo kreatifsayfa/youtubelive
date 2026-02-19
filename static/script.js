@@ -6,6 +6,7 @@
 let currentTab = 'm3u8';
 let selectedFileId = null;
 let selectedChannel = null;
+let youtubeVideoData = null;
 let activeStreamId = null;
 let statusPollInterval = null;
 let iptvChannels = [];
@@ -186,6 +187,13 @@ async function startStream() {
         }
         // Use IPTV endpoint
         return startIptvStream(key, quality.value);
+    } else if (currentTab === 'youtube') {
+        if (!youtubeVideoData) {
+            showNotification('Önce YouTube video bilgisini yükleyin!', 'error');
+            return;
+        }
+        // Use YouTube restream endpoint
+        return startYoutubeStream(key, quality.value);
     }
 
     startBtn.disabled = true;
@@ -335,6 +343,8 @@ function updateStartButton() {
         hasSource = selectedFileId !== null;
     } else if (currentTab === 'iptv') {
         hasSource = selectedChannel !== null;
+    } else if (currentTab === 'youtube') {
+        hasSource = youtubeVideoData !== null;
     }
 
     startBtn.disabled = !hasKey || !hasSource || activeStreamId !== null;
@@ -349,6 +359,90 @@ function updateUI(streaming) {
 // Input change listeners
 youtubeKey.addEventListener('input', updateStartButton);
 m3u8Url.addEventListener('input', updateStartButton);
+
+// ==================== YouTube Restream Functions ====================
+
+const youtubeUrl = document.getElementById('youtubeUrl');
+const youtubeVideoInfoCard = document.getElementById('youtubeVideoInfo');
+const youtubeVideoTitle = document.getElementById('youtubeVideoTitle');
+
+let youtubeUrlTimeout = null;
+youtubeUrl.addEventListener('input', () => {
+    clearTimeout(youtubeUrlTimeout);
+    const url = youtubeUrl.value.trim();
+
+    if (!url) {
+        youtubeVideoInfoCard.style.display = 'none';
+        youtubeVideoData = null;
+        updateStartButton();
+        return;
+    }
+
+    // Check if it looks like a YouTube URL
+    if (url.includes('youtube.com') || url.includes('youtu.be')) {
+        youtubeUrlTimeout = setTimeout(() => fetchYoutubeInfo(url), 1000);
+    }
+});
+
+async function fetchYoutubeInfo(url) {
+    try {
+        const response = await fetch('/api/youtube/info', {
+            method: 'POST',
+            headers: { 'Content-Type': 'application/json' },
+            body: JSON.stringify({ url })
+        });
+
+        const data = await response.json();
+
+        if (data.success) {
+            youtubeVideoData = data.info;
+            youtubeVideoInfoCard.style.display = 'block';
+            youtubeVideoTitle.textContent = youtubeVideoData.title;
+            showNotification('Video bilgisi yüklendi', 'success');
+            updateStartButton();
+        } else {
+            showNotification(`Hata: ${data.error}`, 'error');
+            youtubeVideoData = null;
+            updateStartButton();
+        }
+    } catch (error) {
+        showNotification(`Bağlantı hatası: ${error.message}`, 'error');
+        youtubeVideoData = null;
+        updateStartButton();
+    }
+}
+
+async function startYoutubeStream(key, qualityValue) {
+    startBtn.disabled = true;
+    showNotification('YouTube restream başlatılıyor...', 'info');
+
+    try {
+        const response = await fetch('/api/youtube/stream', {
+            method: 'POST',
+            headers: { 'Content-Type': 'application/json' },
+            body: JSON.stringify({
+                youtube_url: youtubeUrl.value.trim(),
+                youtube_key: key,
+                quality: qualityValue
+            })
+        });
+
+        const data = await response.json();
+
+        if (data.success) {
+            activeStreamId = data.stream_id;
+            showNotification('YouTube restream başladı!', 'success');
+            updateUI(true);
+            startStatusPolling();
+        } else {
+            showNotification(`Hata: ${data.error}`, 'error');
+            startBtn.disabled = false;
+        }
+    } catch (error) {
+        showNotification(`Bağlantı hatası: ${error.message}`, 'error');
+        startBtn.disabled = false;
+    }
+}
 
 // Helpers
 function getStatusText(status) {

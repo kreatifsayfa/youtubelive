@@ -9,10 +9,17 @@ import os
 import subprocess
 import signal
 import uuid
+import re
 from datetime import datetime
 from flask import Flask, render_template, request, jsonify
 from werkzeug.utils import secure_filename
 from m3u_parser import M3UParser
+
+try:
+    import yt_dlp
+    HAS_YTDLP = True
+except ImportError:
+    HAS_YTDLP = False
 
 app = Flask(__name__)
 app.config['MAX_CONTENT_LENGTH'] = 500 * 1024 * 1024  # 500MB max file size
@@ -70,6 +77,77 @@ class StreamProcess:
             '-bufsize', f'{int(bitrate[:-1]) * 2}k',
             '-pix_fmt', 'yuv420p',
             '-g', '50',  # Keyframe every 2 seconds at 25fps
+            '-c:a', 'aac',
+            '-b:a', '128k',
+            '-ar', '44100',
+            '-f', 'flv',
+            rtmp_url
+        ]
+
+        return self._start_process(cmd)
+
+    def start_youtube(self, youtube_url, youtube_key, quality='1080p'):
+        """Start streaming from YouTube video/live to YouTube."""
+        self.source = youtube_url
+        self.youtube_key = youtube_key
+        self.started_at = datetime.now()
+        self.status = 'starting'
+
+        if not HAS_YTDLP:
+            self.status = 'error'
+            self.log.append("Error: yt-dlp not installed. Cannot stream from YouTube.")
+            return False, "yt-dlp not installed. Please install yt-dlp."
+
+        # Get the direct stream URL using yt-dlp
+        try:
+            self.log.append(f"Fetching stream URL for: {youtube_url}")
+            ydl_opts = {
+                'format': 'best[height<=?1080]/best',
+                'quiet': True,
+                'no_warnings': True,
+            }
+
+            with yt_dlp.YoutubeDL(ydl_opts) as ydl:
+                info = ydl.extract_info(youtube_url, download=False)
+                if 'url' not in info:
+                    self.status = 'error'
+                    self.log.append("Error: Could not get stream URL from YouTube")
+                    return False, "Could not get stream URL from YouTube"
+
+                stream_url = info['url']
+                video_title = info.get('title', 'YouTube Video')
+                self.log.append(f"Got stream URL for: {video_title}")
+
+        except Exception as e:
+            self.status = 'error'
+            self.log.append(f"Error fetching YouTube video: {str(e)}")
+            return False, f"Error fetching YouTube video: {str(e)}"
+
+        # Parse quality
+        bitrate_map = {
+            '720p': '2500k',
+            '1080p': '4500k',
+            '1440p': '9000k',
+            '2160p': '18000k'
+        }
+        bitrate = bitrate_map.get(quality, '4500k')
+
+        # YouTube RTMP URL
+        rtmp_url = f"rtmp://a.rtmp.youtube.com/live2/{youtube_key}"
+
+        # FFmpeg command for YouTube streaming
+        # Use -re to stream at native frame rate
+        cmd = [
+            'ffmpeg',
+            '-re',
+            '-i', stream_url,
+            '-c:v', 'libx264',
+            '-preset', 'veryfast',
+            '-b:v', bitrate,
+            '-maxrate', bitrate,
+            '-bufsize', f'{int(bitrate[:-1]) * 2}k',
+            '-pix_fmt', 'yuv420p',
+            '-g', '50',
             '-c:a', 'aac',
             '-b:a', '128k',
             '-ar', '44100',
@@ -458,6 +536,83 @@ def iptv_clear_playlist():
     iptv_playlist_url = None
 
     return jsonify({'success': True, 'message': 'Playlist temizlendi'})
+
+
+# ==================== YouTube Restream Endpoints ====================
+
+@app.route('/api/youtube/info', methods=['POST'])
+def youtube_get_info():
+    """Get info about a YouTube video/live stream."""
+    if not HAS_YTDLP:
+        return jsonify({'success': False, 'error': 'yt-dlp yüklü değil. Sunucuya yt-dlp kurun.'}), 500
+
+    data = request.json
+    url = data.get('url', '').strip()
+
+    if not url:
+        return jsonify({'success': False, 'error': 'YouTube URL gerekli'}), 400
+
+    # Validate YouTube URL
+    youtube_pattern = r'(youtube\.com|youtu\.be)'
+    if not re.search(youtube_pattern, url):
+        return jsonify({'success': False, 'error': 'Geçerli bir YouTube linki girin'}), 400
+
+    try:
+        ydl_opts = {
+            'quiet': True,
+            'no_warnings': True,
+            'skip_download': True,
+        }
+
+        with yt_dlp.YoutubeDL(ydl_opts) as ydl:
+            info = ydl.extract_info(url, download=False)
+
+            return jsonify({
+                'success': True,
+                'info': {
+                    'title': info.get('title', 'Bilinmeyen'),
+                    'duration': info.get('duration'),
+                    'uploader': info.get('uploader', 'Bilinmeyen'),
+                    'is_live': info.get('is_live', False),
+                    'thumbnail': info.get('thumbnail', ''),
+                    'view_count': info.get('view_count', 0),
+                }
+            })
+    except Exception as e:
+        return jsonify({'success': False, 'error': f'Video bilgisi alınamadı: {str(e)}'}), 500
+
+
+@app.route('/api/youtube/stream', methods=['POST'])
+def youtube_start_stream():
+    """Start streaming a YouTube video/live to our YouTube Live."""
+    if not HAS_YTDLP:
+        return jsonify({'success': False, 'error': 'yt-dlp yüklü değil. Sunucuya yt-dlp kurun.'}), 500
+
+    data = request.json
+    youtube_url = data.get('youtube_url', '').strip()
+    youtube_key = data.get('youtube_key', '').strip()
+    quality = data.get('quality', '1080p')
+
+    if not youtube_url:
+        return jsonify({'success': False, 'error': 'YouTube URL gerekli'}), 400
+
+    if not youtube_key:
+        return jsonify({'success': False, 'error': 'YouTube Stream Key gerekli'}), 400
+
+    stream_id = str(uuid.uuid4())
+    stream = StreamProcess(stream_id)
+
+    success, message = stream.start_youtube(youtube_url, youtube_key, quality)
+
+    if success:
+        active_streams[stream_id] = stream
+        return jsonify({
+            'success': True,
+            'stream_id': stream_id,
+            'message': 'YouTube restream başlatıldı'
+        })
+    else:
+        return jsonify({'success': False, 'error': message}), 500
 
 
 if __name__ == '__main__':
