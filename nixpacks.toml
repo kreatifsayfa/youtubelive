@@ -1,0 +1,21 @@
+# Nixpacks Configuration for YouTube Live Streamer
+# Optimized for Dokploy deployment
+
+[phases.setup]
+nixPkgs = ["python3", "ffmpeg", "ffmpeg-full"]
+
+[phases.install]
+cmds = [
+  "pip install --no-cache-dir -r requirements.txt",
+  "pip install gunicorn"
+]
+
+[phases.build]
+cmds = ["mkdir -p uploads"]
+
+[start]
+cmd = "gunicorn --bind 0.0.0.0:$PORT --workers 2 --threads 4 --timeout 600 --keepalive 30 --graceful-timeout 30 app:app"
+
+[variables]
+PORT = "5000"
+PYTHONUNBUFFERED = "1"

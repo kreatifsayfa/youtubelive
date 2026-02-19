@@ -340,10 +340,14 @@ uploaded_files = {}
 
 
 if __name__ == '__main__':
+    port = int(os.environ.get('PORT', 5000))
+    debug = os.environ.get('FLASK_DEBUG', 'false').lower() == 'true'
+
     print("\n" + "="*50)
     print("YouTube Live Streamer")
     print("="*50)
-    print("\nOpen your browser to: http://localhost:5000")
+    print(f"\nRunning on: http://0.0.0.0:{port}")
+    print(f"Debug mode: {debug}")
     print("\nMake sure FFmpeg is installed on your system.")
     print("Install FFmpeg:")
     print("  - Ubuntu/Debian: sudo apt install ffmpeg")
@@ -351,4 +355,4 @@ if __name__ == '__main__':
     print("  - Arch: sudo pacman -S ffmpeg")
     print("\n" + "="*50 + "\n")
 
-    app.run(host='0.0.0.0', port=5000, debug=True)
+    app.run(host='0.0.0.0', port=port, debug=debug)

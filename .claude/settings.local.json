@@ -12,7 +12,9 @@
       "Bash(npm:*)",
       "Bash(ffmpeg:*)",
       "Bash(curl:*)",
-      "Bash(chmod:*)"
+      "Bash(chmod:*)",
+      "Bash(git add:*)",
+      "Bash(git commit:*)"
     ]
   }
 }
