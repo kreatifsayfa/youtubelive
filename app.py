@@ -12,6 +12,7 @@ import uuid
 from datetime import datetime
 from flask import Flask, render_template, request, jsonify
 from werkzeug.utils import secure_filename
+from m3u_parser import M3UParser
 
 app = Flask(__name__)
 app.config['MAX_CONTENT_LENGTH'] = 500 * 1024 * 1024  # 500MB max file size
@@ -337,6 +338,126 @@ def delete_file(file_id):
 
 # Store uploaded files in memory
 uploaded_files = {}
+
+# IPTV state
+iptv_parser = M3UParser(timeout=60)
+iptv_channels = []
+iptv_groups = []
+iptv_playlist_url = None
+
+
+# ==================== IPTV Endpoints ====================
+
+@app.route('/api/iptv/load', methods=['POST'])
+def iptv_load_playlist():
+    """Load and parse an M3U playlist from URL."""
+    global iptv_channels, iptv_groups, iptv_playlist_url
+
+    data = request.json
+    playlist_url = data.get('url', '').strip()
+
+    if not playlist_url:
+        return jsonify({'success': False, 'error': 'Playlist URL is required'}), 400
+
+    try:
+        channels, content = iptv_parser.parse_from_url(playlist_url)
+        groups = iptv_parser.get_groups(channels)
+
+        iptv_channels = channels
+        iptv_groups = groups
+        iptv_playlist_url = playlist_url
+
+        return jsonify({
+            'success': True,
+            'count': len(channels),
+            'groups': groups,
+            'message': f'{len(channels)} kanal yüklendi'
+        })
+    except Exception as e:
+        return jsonify({'success': False, 'error': str(e)}), 500
+
+
+@app.route('/api/iptv/channels', methods=['GET'])
+def iptv_get_channels():
+    """Get list of channels with optional search/filter."""
+    search = request.args.get('search', '').strip()
+    group = request.args.get('group', '').strip()
+    page = int(request.args.get('page', 1))
+    per_page = int(request.args.get('per_page', 100))
+
+    if not iptv_channels:
+        return jsonify({
+            'success': True,
+            'channels': [],
+            'total': 0,
+            'page': page,
+            'pages': 0,
+            'groups': []
+        })
+
+    # Filter channels
+    filtered = iptv_parser.filter_channels(iptv_channels, search=search, group=group)
+
+    # Paginate
+    total = len(filtered)
+    pages = (total + per_page - 1) // per_page
+    start = (page - 1) * per_page
+    end = start + per_page
+    page_channels = filtered[start:end]
+
+    return jsonify({
+        'success': True,
+        'channels': page_channels,
+        'total': total,
+        'page': page,
+        'pages': pages,
+        'groups': iptv_groups
+    })
+
+
+@app.route('/api/iptv/stream', methods=['POST'])
+def iptv_start_stream():
+    """Start streaming a selected IPTV channel to YouTube."""
+    data = request.json
+    channel_url = data.get('channel_url', '').strip()
+    channel_name = data.get('channel_name', 'IPTV Channel')
+    youtube_key = data.get('youtube_key', '').strip()
+    quality = data.get('quality', '1080p')
+
+    if not channel_url:
+        return jsonify({'success': False, 'error': 'Channel URL is required'}), 400
+
+    if not youtube_key:
+        return jsonify({'success': False, 'error': 'YouTube Stream Key is required'}), 400
+
+    stream_id = str(uuid.uuid4())
+    stream = StreamProcess(stream_id)
+
+    # Use the existing M3U8 streaming method - IPTV channels are typically M3U8/TS streams
+    success, message = stream.start_m3u8(channel_url, youtube_key, quality)
+
+    if success:
+        active_streams[stream_id] = stream
+        return jsonify({
+            'success': True,
+            'stream_id': stream_id,
+            'channel_name': channel_name,
+            'message': f'{channel_name} yayını başlatıldı'
+        })
+    else:
+        return jsonify({'success': False, 'error': message}), 500
+
+
+@app.route('/api/iptv/clear', methods=['DELETE'])
+def iptv_clear_playlist():
+    """Clear loaded playlist."""
+    global iptv_channels, iptv_groups, iptv_playlist_url
+
+    iptv_channels = []
+    iptv_groups = []
+    iptv_playlist_url = None
+
+    return jsonify({'success': True, 'message': 'Playlist temizlendi'})
 
 
 if __name__ == '__main__':

@@ -408,6 +408,122 @@ header .subtitle {
     background: var(--warning);
 }
 
+/* IPTV Styles */
+.iptv-controls {
+    display: flex;
+    gap: 10px;
+    margin-bottom: 15px;
+    align-items: center;
+    flex-wrap: wrap;
+}
+
+.channel-search {
+    flex: 1;
+    min-width: 150px;
+    padding: 10px 12px;
+    background: var(--bg-tertiary);
+    border: 1px solid var(--border);
+    border-radius: 8px;
+    color: var(--text-primary);
+    font-size: 0.95rem;
+}
+
+.channel-search:focus {
+    outline: none;
+    border-color: var(--accent);
+}
+
+.channel-group-filter {
+    padding: 10px 12px;
+    background: var(--bg-tertiary);
+    border: 1px solid var(--border);
+    border-radius: 8px;
+    color: var(--text-primary);
+    font-size: 0.95rem;
+    cursor: pointer;
+}
+
+.channel-group-filter:focus {
+    outline: none;
+    border-color: var(--accent);
+}
+
+.channel-count {
+    color: var(--text-secondary);
+    font-size: 0.9rem;
+    padding: 0 10px;
+}
+
+.iptv-channel-list {
+    max-height: 400px;
+    overflow-y: auto;
+    background: var(--bg-tertiary);
+    border-radius: 8px;
+    padding: 10px;
+}
+
+.channel-item {
+    padding: 12px 15px;
+    border-radius: 6px;
+    cursor: pointer;
+    transition: background 0.2s;
+    display: flex;
+    align-items: center;
+    gap: 10px;
+}
+
+.channel-item:hover {
+    background: var(--bg-secondary);
+}
+
+.channel-item.selected {
+    background: rgba(255, 0, 0, 0.15);
+    border: 1px solid var(--accent);
+}
+
+.channel-item-icon {
+    color: var(--accent);
+    font-size: 1.2rem;
+}
+
+.channel-item-name {
+    flex: 1;
+    font-weight: 500;
+}
+
+.channel-item-group {
+    font-size: 0.85rem;
+    color: var(--text-secondary);
+}
+
+.channel-item-group::before {
+    content: "•";
+    margin: 0 5px;
+}
+
+.selected-channel-card {
+    background: var(--bg-tertiary);
+    padding: 15px;
+    border-radius: 8px;
+    border-left: 3px solid var(--accent);
+}
+
+.selected-channel-card h4 {
+    margin-bottom: 5px;
+    color: var(--text-secondary);
+    font-size: 0.9rem;
+}
+
+.selected-channel-name {
+    font-size: 1.1rem;
+    font-weight: 600;
+    color: var(--text-primary);
+}
+
+.btn-icon {
+    font-size: 1.2rem;
+}
+
 /* Responsive */
 @media (max-width: 600px) {
     header h1 {

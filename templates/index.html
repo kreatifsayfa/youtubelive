@@ -40,6 +40,7 @@
                 <div class="tabs">
                     <button class="tab-btn active" data-tab="m3u8">M3U8 URL</button>
                     <button class="tab-btn" data-tab="file">Dosya Yükle</button>
+                    <button class="tab-btn" data-tab="iptv">IPTV Kanalları</button>
                 </div>
 
                 <!-- M3U8 Tab -->
@@ -71,6 +72,39 @@
 
                     <!-- Uploaded Files List -->
                     <div id="uploadedFiles" class="uploaded-files"></div>
+                </div>
+
+                <!-- IPTV Tab -->
+                <div class="tab-content" id="iptv-tab">
+                    <div class="form-group">
+                        <label for="iptvPlaylistUrl">M3U Playlist URL</label>
+                        <input type="text" id="iptvPlaylistUrl" placeholder="http://example.com/playlist.m3u">
+                        <small>IPTV M3U playlist URL'inizi girin</small>
+                    </div>
+                    <button id="loadPlaylistBtn" class="btn btn-primary">
+                        <span class="btn-icon">📡</span> Playlist Yükle
+                    </button>
+
+                    <!-- Channel List -->
+                    <div id="iptvChannelListContainer" style="display: none; margin-top: 20px;">
+                        <div class="iptv-controls">
+                            <input type="text" id="channelSearch" placeholder="Kanal ara..." class="channel-search">
+                            <select id="channelGroupFilter" class="channel-group-filter">
+                                <option value="">Tüm Kategoriler</option>
+                            </select>
+                            <div class="channel-count" id="channelCount">0 kanal</div>
+                        </div>
+
+                        <div id="iptvChannelList" class="iptv-channel-list"></div>
+                    </div>
+
+                    <!-- Selected Channel Info -->
+                    <div id="selectedChannelInfo" style="display: none; margin-top: 15px;">
+                        <div class="selected-channel-card">
+                            <h4>Seçili Kanal:</h4>
+                            <div id="selectedChannelName" class="selected-channel-name"></div>
+                        </div>
+                    </div>
                 </div>
             </section>
 

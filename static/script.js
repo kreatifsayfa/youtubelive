@@ -5,8 +5,11 @@
 // State
 let currentTab = 'm3u8';
 let selectedFileId = null;
+let selectedChannel = null;
 let activeStreamId = null;
 let statusPollInterval = null;
+let iptvChannels = [];
+let iptvGroups = [];
 
 // DOM Elements
 const youtubeKey = document.getElementById('youtubeKey');
@@ -176,6 +179,13 @@ async function startStream() {
         }
         payload.file_id = selectedFileId;
         payload.loop = loopFile.checked;
+    } else if (currentTab === 'iptv') {
+        if (!selectedChannel) {
+            showNotification('Bir kanal seçin!', 'error');
+            return;
+        }
+        // Use IPTV endpoint
+        return startIptvStream(key, quality.value);
     }
 
     startBtn.disabled = true;
@@ -193,6 +203,39 @@ async function startStream() {
         if (data.success) {
             activeStreamId = data.stream_id;
             showNotification('Yayın başladı!', 'success');
+            updateUI(true);
+            startStatusPolling();
+        } else {
+            showNotification(`Hata: ${data.error}`, 'error');
+            startBtn.disabled = false;
+        }
+    } catch (error) {
+        showNotification(`Bağlantı hatası: ${error.message}`, 'error');
+        startBtn.disabled = false;
+    }
+}
+
+async function startIptvStream(key, qualityValue) {
+    startBtn.disabled = true;
+    showNotification('IPTV yayını başlatılıyor...', 'info');
+
+    try {
+        const response = await fetch('/api/iptv/stream', {
+            method: 'POST',
+            headers: { 'Content-Type': 'application/json' },
+            body: JSON.stringify({
+                channel_url: selectedChannel.url,
+                channel_name: selectedChannel.name,
+                youtube_key: key,
+                quality: qualityValue
+            })
+        });
+
+        const data = await response.json();
+
+        if (data.success) {
+            activeStreamId = data.stream_id;
+            showNotification(`${data.channel_name} yayını başladı!`, 'success');
             updateUI(true);
             startStatusPolling();
         } else {
@@ -290,6 +333,8 @@ function updateStartButton() {
         hasSource = m3u8Url.value.trim().length > 0;
     } else if (currentTab === 'file') {
         hasSource = selectedFileId !== null;
+    } else if (currentTab === 'iptv') {
+        hasSource = selectedChannel !== null;
     }
 
     startBtn.disabled = !hasKey || !hasSource || activeStreamId !== null;
@@ -337,6 +382,135 @@ function showNotification(message, type = 'info') {
         setTimeout(() => notification.remove(), 300);
     }, 3000);
 }
+
+// ==================== IPTV Functions ====================
+
+const iptvPlaylistUrl = document.getElementById('iptvPlaylistUrl');
+const loadPlaylistBtn = document.getElementById('loadPlaylistBtn');
+const iptvChannelListContainer = document.getElementById('iptvChannelListContainer');
+const iptvChannelList = document.getElementById('iptvChannelList');
+const channelSearch = document.getElementById('channelSearch');
+const channelGroupFilter = document.getElementById('channelGroupFilter');
+const channelCount = document.getElementById('channelCount');
+const selectedChannelInfo = document.getElementById('selectedChannelInfo');
+const selectedChannelName = document.getElementById('selectedChannelName');
+
+// Load Playlist
+loadPlaylistBtn.addEventListener('click', loadPlaylist);
+
+async function loadPlaylist() {
+    const url = iptvPlaylistUrl.value.trim();
+    if (!url) {
+        showNotification('Playlist URL gerekli!', 'error');
+        return;
+    }
+
+    loadPlaylistBtn.disabled = true;
+    loadPlaylistBtn.textContent = 'Yükleniyor...';
+    showNotification('Playlist yükleniyor, lütfen bekleyin...', 'info');
+
+    try {
+        const response = await fetch('/api/iptv/load', {
+            method: 'POST',
+            headers: { 'Content-Type': 'application/json' },
+            body: JSON.stringify({ url })
+        });
+
+        const data = await response.json();
+
+        if (data.success) {
+            showNotification(`${data.count} kanal yüklendi!`, 'success');
+            iptvGroups = data.groups || [];
+            populateGroupFilter();
+            loadChannels();
+            iptvChannelListContainer.style.display = 'block';
+        } else {
+            showNotification(`Hata: ${data.error}`, 'error');
+        }
+    } catch (error) {
+        showNotification(`Bağlantı hatası: ${error.message}`, 'error');
+    }
+
+    loadPlaylistBtn.disabled = false;
+    loadPlaylistBtn.innerHTML = '<span class="btn-icon">📡</span> Playlist Yükle';
+}
+
+function populateGroupFilter() {
+    channelGroupFilter.innerHTML = '<option value="">Tüm Kategoriler</option>';
+    iptvGroups.forEach(group => {
+        const option = document.createElement('option');
+        option.value = group;
+        option.textContent = group;
+        channelGroupFilter.appendChild(option);
+    });
+}
+
+async function loadChannels() {
+    const search = channelSearch.value.trim();
+    const group = channelGroupFilter.value;
+
+    try {
+        const params = new URLSearchParams();
+        if (search) params.set('search', search);
+        if (group) params.set('group', group);
+        params.set('per_page', '500');
+
+        const response = await fetch(`/api/iptv/channels?${params}`);
+        const data = await response.json();
+
+        if (data.success) {
+            iptvChannels = data.channels;
+            renderChannels(data.channels);
+            channelCount.textContent = `${data.total} kanal`;
+        }
+    } catch (error) {
+        console.error('Error loading channels:', error);
+    }
+}
+
+function renderChannels(channels) {
+    if (channels.length === 0) {
+        iptvChannelList.innerHTML = '<div style="text-align: center; padding: 20px; color: var(--text-secondary);">Kanal bulunamadı</div>';
+        return;
+    }
+
+    iptvChannelList.innerHTML = channels.map(ch => `
+        <div class="channel-item ${selectedChannel && selectedChannel.id === ch.id ? 'selected' : ''}"
+             onclick="selectChannel('${ch.id}')">
+            <span class="channel-item-icon">📺</span>
+            <span class="channel-item-name">${escapeHtml(ch.name)}</span>
+            ${ch.group ? `<span class="channel-item-group">${escapeHtml(ch.group)}</span>` : ''}
+        </div>
+    `).join('');
+}
+
+function escapeHtml(text) {
+    const div = document.createElement('div');
+    div.textContent = text;
+    return div.innerHTML;
+}
+
+function selectChannel(channelId) {
+    const channel = iptvChannels.find(c => c.id === channelId);
+    if (!channel) return;
+
+    selectedChannel = channel;
+    selectedChannelInfo.style.display = 'block';
+    selectedChannelName.textContent = channel.name;
+
+    // Re-render to update selection highlight
+    renderChannels(iptvChannels);
+    updateStartButton();
+}
+
+// Channel search and filter
+let searchTimeout = null;
+channelSearch.addEventListener('input', () => {
+    clearTimeout(searchTimeout);
+    searchTimeout = setTimeout(loadChannels, 300);
+});
+
+channelGroupFilter.addEventListener('change', loadChannels);
 
 // Initial load
 loadFiles();
