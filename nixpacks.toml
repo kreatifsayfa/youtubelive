@@ -13,7 +13,7 @@ cmds = [
 cmds = ["mkdir -p uploads"]
 
 [start]
-cmd = "python3.12 -m gunicorn --bind 0.0.0.0:$PORT --workers 2 --threads 4 --timeout 600 --keepalive 30 --graceful-timeout 30 app:app"
+cmd = "python3.12 -m gunicorn --bind 0.0.0.0:$PORT --workers 2 --threads 4 --timeout 600 --graceful-timeout 30 app:app"
 
 [variables]
 PORT = "5000"
