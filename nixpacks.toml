@@ -2,7 +2,7 @@
 # Optimized for Dokploy deployment
 
 [phases.setup]
-nixPkgs = ["python3", "ffmpeg", "ffmpeg-full"]
+nixPkgs = ["python3", "ffmpeg-full"]
 
 [phases.install]
 cmds = [
