@@ -9,6 +9,7 @@ let selectedChannel = null;
 let youtubeVideoData = null;
 let activeStreamId = null;
 let statusPollInterval = null;
+let healthPollInterval = null;
 let status404Count = 0;
 let iptvChannels = [];
 let iptvGroups = [];
@@ -28,6 +29,15 @@ const sourceValue = document.getElementById('sourceValue');
 const startedAtValue = document.getElementById('startedAtValue');
 const streamLog = document.getElementById('streamLog');
 const uploadedFiles = document.getElementById('uploadedFiles');
+const ffmpegHealthBadge = document.getElementById('ffmpegHealthBadge');
+const healthTotalStreams = document.getElementById('healthTotalStreams');
+const healthRunningStreams = document.getElementById('healthRunningStreams');
+const healthRestartingStreams = document.getElementById('healthRestartingStreams');
+const healthErrorStreams = document.getElementById('healthErrorStreams');
+const healthRestartTotal = document.getElementById('healthRestartTotal');
+const healthWorkerPid = document.getElementById('healthWorkerPid');
+const healthLastUpdated = document.getElementById('healthLastUpdated');
+const healthStreamsList = document.getElementById('healthStreamsList');
 
 // Tab Management
 document.querySelectorAll('.tab-btn').forEach(btn => {
@@ -119,7 +129,7 @@ function renderFiles(files) {
         <div class="file-item ${selectedFileId === file.id ? 'selected' : ''}"
              onclick="selectFile('${file.id}')">
             <div class="file-info">
-                <div class="file-name">${file.name}</div>
+                <div class="file-name">${escapeHtml(file.name)}</div>
                 <div class="file-size">${formatSize(file.size)}</div>
             </div>
             <button class="file-delete" onclick="event.stopPropagation(); deleteFile('${file.id}')">&times;</button>
@@ -214,6 +224,7 @@ async function startStream() {
             showNotification('Yayın başladı!', 'success');
             updateUI(true);
             startStatusPolling();
+            pollHealth();
         } else {
             showNotification(`Hata: ${data.error}`, 'error');
             startBtn.disabled = false;
@@ -247,6 +258,7 @@ async function startIptvStream(key, qualityValue) {
             showNotification(`${data.channel_name} yayını başladı!`, 'success');
             updateUI(true);
             startStatusPolling();
+            pollHealth();
         } else {
             showNotification(`Hata: ${data.error}`, 'error');
             startBtn.disabled = false;
@@ -274,6 +286,7 @@ async function stopStream() {
             activeStreamId = null;
             updateUI(false);
             stopStatusPolling();
+            pollHealth();
         } else {
             showNotification(`Hata: ${data.error}`, 'error');
         }
@@ -286,6 +299,7 @@ async function stopStream() {
 
 // Status Polling
 function startStatusPolling() {
+    stopStatusPolling();
     status404Count = 0; // Reset counter
     statusPollInterval = setInterval(pollStatus, 3000);
     pollStatus();
@@ -298,23 +312,130 @@ function stopStatusPolling() {
     }
 }
 
+function startHealthPolling() {
+    if (!ffmpegHealthBadge) return;
+    stopHealthPolling();
+    healthPollInterval = setInterval(pollHealth, 5000);
+    pollHealth();
+}
+
+function stopHealthPolling() {
+    if (healthPollInterval) {
+        clearInterval(healthPollInterval);
+        healthPollInterval = null;
+    }
+}
+
+async function pollHealth() {
+    if (!ffmpegHealthBadge) return;
+
+    try {
+        const response = await fetch('/api/health');
+        if (!response.ok) {
+            throw new Error(`Health HTTP ${response.status}`);
+        }
+
+        const data = await response.json();
+        if (!data.success) return;
+
+        ffmpegHealthBadge.textContent = data.ffmpeg_available ? 'Hazir' : 'Bulunamadi';
+        ffmpegHealthBadge.className = `health-badge ${data.ffmpeg_available ? 'ok' : 'error'}`;
+
+        const counts = data.status_counts || {};
+        healthTotalStreams.textContent = String(data.total_streams || 0);
+        healthRunningStreams.textContent = String(counts.running || 0);
+        healthRestartingStreams.textContent = String(counts.restarting || 0);
+        healthErrorStreams.textContent = String(counts.error || 0);
+        healthRestartTotal.textContent = String(data.restart_total || 0);
+        healthWorkerPid.textContent = String(data.worker_pid || '-');
+        healthLastUpdated.textContent = new Date().toLocaleString('tr-TR');
+
+        renderHealthStreams(data.streams || []);
+    } catch (error) {
+        ffmpegHealthBadge.textContent = 'Erisim Hatasi';
+        ffmpegHealthBadge.className = 'health-badge error';
+        healthLastUpdated.textContent = new Date().toLocaleString('tr-TR');
+        console.error('Health poll error:', error);
+    }
+}
+
+function renderHealthStreams(streams) {
+    if (!healthStreamsList) return;
+
+    if (!Array.isArray(streams) || streams.length === 0) {
+        healthStreamsList.innerHTML = '<div class="health-empty">Aktif stream metrik kaydi yok.</div>';
+        return;
+    }
+
+    const sorted = [...streams].sort((a, b) => {
+        const runningDiff = Number(Boolean(b.is_running)) - Number(Boolean(a.is_running));
+        if (runningDiff !== 0) return runningDiff;
+        return Number(b.restart_attempts || 0) - Number(a.restart_attempts || 0);
+    });
+
+    const rows = sorted.slice(0, 25).map(stream => {
+        const status = stream.status || 'unknown';
+        const statusClass = getHealthStatusClass(status);
+        const source = escapeHtml(shortenText(stream.source || '-', 58));
+        const restarts = Number(stream.restart_attempts || 0);
+        const uptime = formatUptime(stream.uptime_seconds);
+
+        return `
+            <div class="health-stream-row">
+                <div class="health-stream-source" title="${escapeHtml(stream.source || '-')}">${source}</div>
+                <div class="health-stream-status">
+                    <span class="health-badge ${statusClass}">${escapeHtml(getStatusText(status))}</span>
+                </div>
+                <div>${restarts}</div>
+                <div>${uptime}</div>
+                <div>${stream.pid || '-'}</div>
+            </div>
+        `;
+    }).join('');
+
+    healthStreamsList.innerHTML = `
+        <div class="health-stream-row header">
+            <div>Kaynak</div>
+            <div>Durum</div>
+            <div>Restart</div>
+            <div>Uptime</div>
+            <div>PID</div>
+        </div>
+        ${rows}
+    `;
+}
+
+function getHealthStatusClass(status) {
+    if (status === 'running') return 'ok';
+    if (status === 'starting' || status === 'restarting') return 'warn';
+    if (status === 'error') return 'error';
+    return 'warn';
+}
+
+function shortenText(value, maxLen = 60) {
+    if (!value) return '-';
+    if (value.length <= maxLen) return value;
+    return `${value.slice(0, maxLen - 3)}...`;
+}
+
 async function pollStatus() {
     if (!activeStreamId) return;
 
     try {
         const response = await fetch(`/api/streams/${activeStreamId}/status`);
 
-        // Stream bulunamadıysa (404)
+        // Stream bulunamadiysa (404)
         if (response.status === 404) {
             status404Count++;
             console.warn(`Stream not found (attempt ${status404Count})`);
-            // 10 denemeden sonra yayını durdurulmuş say
+            // 10 denemeden sonra yayini durdurulmus say
             if (status404Count >= 10) {
-                showNotification('Yayın bağlantısı kesildi', 'error');
+                showNotification('Yayin baglantisi kesildi', 'error');
                 activeStreamId = null;
                 status404Count = 0;
                 updateUI(false);
                 stopStatusPolling();
+                pollHealth();
             }
             return;
         }
@@ -333,17 +454,25 @@ async function pollStatus() {
             // Update log
             if (data.log && data.log.length > 0) {
                 streamLog.innerHTML = data.log.map(entry =>
-                    `<div class="log-entry">${entry}</div>`
+                    `<div class="log-entry">${escapeHtml(entry)}</div>`
                 ).join('');
                 streamLog.scrollTop = streamLog.scrollHeight;
             }
 
             // Check if stream stopped unexpectedly
-            if (!data.is_running && data.status !== 'stopped') {
-                showNotification('Yayın beklenmedik şekilde durdu!', 'error');
+            const transientStatuses = ['starting', 'restarting'];
+            if (!data.is_running && !transientStatuses.includes(data.status) && data.status !== 'stopped') {
+                showNotification('Yayin beklenmedik sekilde durdu!', 'error');
                 activeStreamId = null;
                 updateUI(false);
                 stopStatusPolling();
+                pollHealth();
+            } else if (!data.is_running && data.status === 'stopped') {
+                showNotification('Yayin durdu', 'info');
+                activeStreamId = null;
+                updateUI(false);
+                stopStatusPolling();
+                pollHealth();
             }
         }
     } catch (error) {
@@ -453,6 +582,7 @@ async function startYoutubeStream(key, qualityValue) {
             showNotification('YouTube restream başladı!', 'success');
             updateUI(true);
             startStatusPolling();
+            pollHealth();
         } else {
             showNotification(`Hata: ${data.error}`, 'error');
             startBtn.disabled = false;
@@ -467,8 +597,9 @@ async function startYoutubeStream(key, qualityValue) {
 function getStatusText(status) {
     const map = {
         'idle': 'Beklemede',
-        'starting': 'Başlatılıyor...',
-        'running': 'Yayında',
+        'starting': 'Baslatiliyor...',
+        'restarting': 'Yeniden baglaniyor...',
+        'running': 'Yayinda',
         'stopped': 'Durduruldu',
         'error': 'Hata'
     };
@@ -483,6 +614,21 @@ function formatSize(bytes) {
     return parseFloat((bytes / Math.pow(k, i)).toFixed(2)) + ' ' + sizes[i];
 }
 
+function formatUptime(seconds) {
+    if (seconds === null || seconds === undefined || Number.isNaN(Number(seconds))) {
+        return '-';
+    }
+
+    const total = Math.max(0, Number(seconds));
+    const hrs = Math.floor(total / 3600);
+    const mins = Math.floor((total % 3600) / 60);
+    const secs = Math.floor(total % 60);
+
+    if (hrs > 0) return `${hrs}h ${mins}m`;
+    if (mins > 0) return `${mins}m ${secs}s`;
+    return `${secs}s`;
+}
+
 function showNotification(message, type = 'info') {
     const notification = document.createElement('div');
     notification.className = `notification ${type}`;
@@ -494,6 +640,31 @@ function showNotification(message, type = 'info') {
         notification.style.opacity = '0';
         setTimeout(() => notification.remove(), 300);
     }, 3000);
+}
+
+async function restoreActiveStream() {
+    try {
+        const response = await fetch('/api/streams');
+        const data = await response.json();
+        if (!data.success || !Array.isArray(data.streams) || data.streams.length === 0) {
+            return;
+        }
+
+        const runningLike = data.streams.find(s =>
+            ['running', 'starting', 'restarting'].includes(s.status)
+        );
+        if (!runningLike) {
+            return;
+        }
+
+        activeStreamId = runningLike.id;
+        updateUI(true);
+        startStatusPolling();
+        pollHealth();
+        showNotification('Aktif yayin tekrar baglandi', 'info');
+    } catch (error) {
+        console.error('Failed to restore active stream:', error);
+    }
 }
 
 // ==================== IPTV Functions ====================
@@ -627,3 +798,10 @@ channelGroupFilter.addEventListener('change', loadChannels);
 
 // Initial load
 loadFiles();
+restoreActiveStream();
+startHealthPolling();
+
+window.addEventListener('beforeunload', () => {
+    stopStatusPolling();
+    stopHealthPolling();
+});

@@ -10,6 +10,9 @@ import subprocess
 import signal
 import uuid
 import re
+import shutil
+import threading
+from collections import deque
 from datetime import datetime
 from flask import Flask, render_template, request, jsonify
 from werkzeug.utils import secure_filename
@@ -32,6 +35,13 @@ os.makedirs(app.config['UPLOAD_FOLDER'], exist_ok=True)
 # Store active streams
 active_streams = {}
 
+BITRATE_MAP = {
+    '720p': '2500k',
+    '1080p': '4500k',
+    '1440p': '9000k',
+    '2160p': '18000k'
+}
+
 
 class StreamProcess:
     """Manages an FFmpeg streaming process."""
@@ -39,68 +49,132 @@ class StreamProcess:
     def __init__(self, stream_id):
         self.stream_id = stream_id
         self.process = None
+        self.process_lock = threading.Lock()
+        self.monitor_thread = None
+        self.stop_event = threading.Event()
         self.source = None
+        self.source_type = None
         self.youtube_key = None
         self.status = 'idle'
         self.started_at = None
-        self.log = []
+        self.log = deque(maxlen=200)
+        self.current_cmd = []
+        self.auto_restart = False
+        self.max_restarts = int(os.environ.get('STREAM_MAX_RESTARTS', 5))
+        self.restart_backoff_seconds = int(os.environ.get('STREAM_RESTART_BACKOFF', 3))
+        self.restart_attempts = 0
+        self.manually_stopped = False
+        self.last_exit_code = None
+        self.last_error = None
+        self.pid = None
 
-    def start_m3u8(self, m3u8_url, youtube_key, quality='1080p'):
-        """Start streaming from M3U8 URL to YouTube."""
-        self.source = m3u8_url
-        self.youtube_key = youtube_key
-        self.started_at = datetime.now()
-        self.status = 'starting'
+    def _append_log(self, message):
+        """Add a timestamped entry to stream logs."""
+        if not message:
+            return
+        clean_message = str(message).strip()
+        if not clean_message:
+            return
+        timestamp = datetime.now().strftime('%H:%M:%S')
+        self.log.append(f'[{timestamp}] {clean_message}')
 
-        # Parse quality
-        bitrate_map = {
-            '720p': '2500k',
-            '1080p': '4500k',
-            '1440p': '9000k',
-            '2160p': '18000k'
-        }
-        bitrate = bitrate_map.get(quality, '4500k')
-        resolution = quality if quality in bitrate_map else '1920:1080'
+    def _get_bitrate(self, quality):
+        """Resolve output bitrate by quality preset."""
+        return BITRATE_MAP.get(quality, BITRATE_MAP['1080p'])
 
-        # YouTube RTMP URL
-        rtmp_url = f"rtmp://a.rtmp.youtube.com/live2/{youtube_key}"
+    @staticmethod
+    def _extract_stream_url(info):
+        """Best-effort extraction for direct media URL from yt-dlp payload."""
+        direct_url = info.get('url')
+        if direct_url:
+            return direct_url
 
-        # FFmpeg command for M3U8 streaming
-        cmd = [
-            'ffmpeg',
-            '-re',  # Read input at native frame rate
-            '-i', m3u8_url,
+        formats = info.get('formats') or []
+        for fmt in reversed(formats):
+            candidate = fmt.get('url')
+            if candidate and fmt.get('vcodec') != 'none':
+                return candidate
+
+        entries = info.get('entries') or []
+        for entry in entries:
+            if not isinstance(entry, dict):
+                continue
+            candidate = entry.get('url')
+            if candidate:
+                return candidate
+        return None
+
+    def _build_ffmpeg_cmd(self, input_options, source_input, bitrate, rtmp_url):
+        """Build a resilient FFmpeg command for YouTube RTMP output."""
+        command = ['ffmpeg', '-hide_banner', '-nostats', '-loglevel', 'info']
+        command.extend(input_options)
+        command.extend([
+            '-i', source_input,
+            '-map', '0:v:0',
+            '-map', '0:a:0?',
             '-c:v', 'libx264',
             '-preset', 'veryfast',
             '-b:v', bitrate,
             '-maxrate', bitrate,
             '-bufsize', f'{int(bitrate[:-1]) * 2}k',
             '-pix_fmt', 'yuv420p',
-            '-g', '50',  # Keyframe every 2 seconds at 25fps
+            '-g', '50',
+            '-keyint_min', '50',
+            '-sc_threshold', '0',
             '-c:a', 'aac',
             '-b:a', '128k',
             '-ar', '44100',
+            '-ac', '2',
             '-f', 'flv',
+            '-flvflags', 'no_duration_filesize',
+            '-rtmp_live', 'live',
             rtmp_url
+        ])
+        return command
+
+    def start_m3u8(self, m3u8_url, youtube_key, quality='1080p'):
+        """Start streaming from M3U8 URL to YouTube."""
+        self.source = m3u8_url
+        self.source_type = 'm3u8'
+        self.youtube_key = youtube_key
+        self.started_at = datetime.now()
+        self.status = 'starting'
+        self.auto_restart = True
+        self.restart_attempts = 0
+        bitrate = self._get_bitrate(quality)
+
+        rtmp_url = f"rtmp://a.rtmp.youtube.com/live2/{youtube_key}"
+
+        input_options = [
+            '-re',
+            '-thread_queue_size', '1024',
+            '-rw_timeout', '15000000',
+            '-reconnect', '1',
+            '-reconnect_streamed', '1',
+            '-reconnect_at_eof', '1',
+            '-reconnect_delay_max', '8'
         ]
+        cmd = self._build_ffmpeg_cmd(input_options, m3u8_url, bitrate, rtmp_url)
 
         return self._start_process(cmd)
 
     def start_youtube(self, youtube_url, youtube_key, quality='1080p'):
         """Start streaming from YouTube video/live to YouTube."""
         self.source = youtube_url
+        self.source_type = 'youtube'
         self.youtube_key = youtube_key
         self.started_at = datetime.now()
         self.status = 'starting'
+        self.auto_restart = True
+        self.restart_attempts = 0
 
         if not HAS_YTDLP:
             self.status = 'error'
-            self.log.append("Error: yt-dlp not installed. Cannot stream from YouTube.")
-            return False, "yt-dlp yüklü değil. Sunucuya yt-dlp kurun."
+            self._append_log('Error: yt-dlp not installed. Cannot stream from YouTube.')
+            return False, 'yt-dlp yüklü değil. Sunucuya yt-dlp kurun.'
 
-        # Get the direct stream URL using yt-dlp
         try:
-            self.log.append(f"Fetching stream URL for: {youtube_url}")
+            self._append_log(f'Fetching stream URL for: {youtube_url}')
             ydl_opts = {
                 'format': 'best[height<=?1080]/best',
                 'quiet': False,
@@ -109,143 +183,248 @@ class StreamProcess:
 
             with yt_dlp.YoutubeDL(ydl_opts) as ydl:
                 info = ydl.extract_info(youtube_url, download=False)
-                if 'url' not in info:
+                stream_url = self._extract_stream_url(info)
+                if not stream_url:
                     self.status = 'error'
-                    self.log.append("Error: Could not get stream URL from YouTube")
-                    return False, "Stream URL alınamadı"
+                    self._append_log('Error: Could not get stream URL from YouTube')
+                    return False, 'Stream URL alınamadı'
 
-                stream_url = info['url']
                 video_title = info.get('title', 'YouTube Video')
-                self.log.append(f"Got stream URL for: {video_title}")
+                self._append_log(f'Got stream URL for: {video_title}')
 
         except Exception as e:
             self.status = 'error'
-            error_msg = f"Error fetching YouTube video: {str(e)}"
-            self.log.append(error_msg)
+            error_msg = f'Error fetching YouTube video: {str(e)}'
+            self._append_log(error_msg)
             return False, error_msg
 
-        # Parse quality
-        bitrate_map = {
-            '720p': '2500k',
-            '1080p': '4500k',
-            '1440p': '9000k',
-            '2160p': '18000k'
-        }
-        bitrate = bitrate_map.get(quality, '4500k')
-
-        # YouTube RTMP URL
+        bitrate = self._get_bitrate(quality)
         rtmp_url = f"rtmp://a.rtmp.youtube.com/live2/{youtube_key}"
 
-        # FFmpeg command for YouTube streaming
-        # Use -re to stream at native frame rate
-        cmd = [
-            'ffmpeg',
+        input_options = [
             '-re',
-            '-i', stream_url,
-            '-c:v', 'libx264',
-            '-preset', 'veryfast',
-            '-b:v', bitrate,
-            '-maxrate', bitrate,
-            '-bufsize', f'{int(bitrate[:-1]) * 2}k',
-            '-pix_fmt', 'yuv420p',
-            '-g', '50',
-            '-c:a', 'aac',
-            '-b:a', '128k',
-            '-ar', '44100',
-            '-f', 'flv',
-            rtmp_url
+            '-thread_queue_size', '1024',
+            '-rw_timeout', '15000000',
+            '-reconnect', '1',
+            '-reconnect_streamed', '1',
+            '-reconnect_at_eof', '1',
+            '-reconnect_delay_max', '8'
         ]
+        cmd = self._build_ffmpeg_cmd(input_options, stream_url, bitrate, rtmp_url)
 
         return self._start_process(cmd)
 
     def start_file(self, file_path, youtube_key, quality='1080p', loop=False):
         """Start streaming from video file to YouTube."""
         self.source = file_path
+        self.source_type = 'file'
         self.youtube_key = youtube_key
         self.started_at = datetime.now()
         self.status = 'starting'
+        self.auto_restart = False
+        self.restart_attempts = 0
 
-        bitrate_map = {
-            '720p': '2500k',
-            '1080p': '4500k',
-            '1440p': '9000k',
-            '2160p': '18000k'
-        }
-        bitrate = bitrate_map.get(quality, '4500k')
-
+        bitrate = self._get_bitrate(quality)
         rtmp_url = f"rtmp://a.rtmp.youtube.com/live2/{youtube_key}"
 
-        cmd = [
-            'ffmpeg',
-            '-re',  # Read input at native frame rate
+        input_options = [
+            '-re',
         ]
 
         if loop:
-            cmd.extend(['-stream_loop', '-1'])
+            input_options.extend(['-stream_loop', '-1'])
 
-        cmd.extend([
-            '-i', file_path,
-            '-c:v', 'libx264',
-            '-preset', 'veryfast',
-            '-b:v', bitrate,
-            '-maxrate', bitrate,
-            '-bufsize', f'{int(bitrate[:-1]) * 2}k',
-            '-pix_fmt', 'yuv420p',
-            '-g', '50',
-            '-c:a', 'aac',
-            '-b:a', '128k',
-            '-ar', '44100',
-            '-f', 'flv',
-            rtmp_url
-        ])
+        cmd = self._build_ffmpeg_cmd(input_options, file_path, bitrate, rtmp_url)
 
         return self._start_process(cmd)
 
     def _start_process(self, cmd):
         """Start the FFmpeg process."""
         try:
-            self.log.append(f"Starting: {' '.join(cmd)}")
-            self.process = subprocess.Popen(
-                cmd,
-                stdout=subprocess.PIPE,
-                stderr=subprocess.PIPE,
-                stdin=subprocess.PIPE
-            )
-            self.status = 'running'
-            return True, "Stream started successfully"
+            with self.process_lock:
+                self.current_cmd = cmd
+                self.manually_stopped = False
+                self.stop_event.clear()
+                self._append_log(f"Starting: {' '.join(cmd)}")
+                self.process = subprocess.Popen(
+                    cmd,
+                    stdout=subprocess.DEVNULL,
+                    stderr=subprocess.PIPE,
+                    stdin=subprocess.PIPE,
+                    text=True,
+                    bufsize=1
+                )
+                self.pid = self.process.pid
+                self.status = 'running'
+            self._start_monitor_thread()
+            return True, 'Stream started successfully'
         except FileNotFoundError:
             self.status = 'error'
-            self.log.append("Error: FFmpeg not found. Please install FFmpeg.")
-            return False, "FFmpeg not found. Please install FFmpeg."
+            self._append_log('Error: FFmpeg not found. Please install FFmpeg.')
+            return False, 'FFmpeg not found. Please install FFmpeg.'
         except Exception as e:
             self.status = 'error'
-            self.log.append(f"Error: {str(e)}")
+            self.last_error = str(e)
+            self._append_log(f'Error: {str(e)}')
             return False, str(e)
+
+    def _start_monitor_thread(self):
+        """Start background monitoring thread for stderr consumption and lifecycle."""
+        monitor = threading.Thread(target=self._monitor_process, daemon=True)
+        self.monitor_thread = monitor
+        monitor.start()
+
+    def _monitor_process(self):
+        """Consume FFmpeg stderr to prevent buffer lock and detect exits."""
+        with self.process_lock:
+            process = self.process
+
+        if not process:
+            return
+
+        try:
+            if process.stderr:
+                for line in process.stderr:
+                    if self.stop_event.is_set():
+                        break
+                    self._append_log(line)
+        except Exception as monitor_error:
+            self._append_log(f'Monitor error: {monitor_error}')
+
+        exit_code = process.poll()
+        if exit_code is None:
+            try:
+                exit_code = process.wait(timeout=1)
+            except Exception:
+                exit_code = None
+
+        if exit_code is None:
+            return
+
+        with self.process_lock:
+            if self.process is not process:
+                return
+            self.last_exit_code = exit_code
+            self.process = None
+            self.pid = None
+
+        if self.manually_stopped or self.stop_event.is_set():
+            if self.status != 'stopped':
+                self.status = 'stopped'
+                self._append_log('Stream stopped')
+            return
+
+        if exit_code == 0:
+            self.status = 'stopped'
+            self._append_log('FFmpeg exited normally')
+            return
+
+        self.status = 'error'
+        self.last_error = f'FFmpeg exited with code {exit_code}'
+        self._append_log(self.last_error)
+
+        if self.auto_restart and self.restart_attempts < self.max_restarts:
+            self.restart_attempts += 1
+            delay = min(self.restart_backoff_seconds * self.restart_attempts, 30)
+            self.status = 'restarting'
+            self._append_log(
+                f'Restarting stream in {delay}s '
+                f'({self.restart_attempts}/{self.max_restarts})'
+            )
+            if not self.stop_event.wait(delay):
+                self._restart_process()
+        else:
+            self._append_log('Restart limit reached')
+
+    def _restart_process(self):
+        """Restart FFmpeg with the last known command."""
+        with self.process_lock:
+            if self.manually_stopped or self.stop_event.is_set():
+                return
+            if not self.current_cmd:
+                self.status = 'error'
+                self._append_log('Restart failed: command is missing')
+                return
+
+            try:
+                self.process = subprocess.Popen(
+                    self.current_cmd,
+                    stdout=subprocess.DEVNULL,
+                    stderr=subprocess.PIPE,
+                    stdin=subprocess.PIPE,
+                    text=True,
+                    bufsize=1
+                )
+                self.pid = self.process.pid
+                self.status = 'running'
+                self._append_log(f'FFmpeg restarted (pid: {self.pid})')
+            except Exception as restart_error:
+                self.status = 'error'
+                self.last_error = f'Restart failed: {restart_error}'
+                self._append_log(self.last_error)
+                return
+
+        self._start_monitor_thread()
 
     def stop(self):
         """Stop the streaming process."""
-        if self.process:
+        self.manually_stopped = True
+        self.auto_restart = False
+        self.stop_event.set()
+
+        with self.process_lock:
+            process = self.process
+
+        if process:
             try:
-                self.process.send_signal(signal.SIGTERM)
-                self.process.wait(timeout=5)
-            except:
+                if process.stdin:
+                    process.stdin.write('q\n')
+                    process.stdin.flush()
+            except Exception:
+                pass
+
+            try:
+                process.send_signal(signal.SIGTERM)
+                process.wait(timeout=8)
+            except Exception:
                 try:
-                    self.process.kill()
-                except:
+                    process.kill()
+                except Exception:
                     pass
+
+        with self.process_lock:
             self.process = None
+            self.pid = None
+
         self.status = 'stopped'
-        self.log.append("Stream stopped")
+        self._append_log('Stream stopped by user')
 
     def is_running(self):
         """Check if the process is still running."""
-        return self.process and self.process.poll() is None
+        with self.process_lock:
+            return bool(self.process and self.process.poll() is None)
+
+    def refresh_runtime_status(self):
+        """Refresh stream status based on process state."""
+        running = self.is_running()
+        if running and self.status not in ('running', 'starting', 'restarting'):
+            self.status = 'running'
+            return
+
+        if not running and self.status in ('running', 'starting'):
+            self.status = 'error'
+            if self.last_exit_code is not None:
+                self._append_log(f'FFmpeg not running (last code: {self.last_exit_code})')
+            else:
+                self._append_log('FFmpeg not running')
 
     def get_output(self):
         """Get recent FFmpeg output."""
-        if not self.process:
-            return ""
-        return ""
+        return '\n'.join(self.get_recent_log(20))
+
+    def get_recent_log(self, limit=10):
+        """Return latest log records."""
+        return list(self.log)[-limit:]
 
 
 def allowed_file(filename):
@@ -310,17 +489,27 @@ def stop_stream(stream_id):
     stream = active_streams.get(stream_id)
 
     if not stream:
-        # Check state file for multi-worker support
         state = load_stream_state()
-        if stream_id in state:
-            del state[stream_id]
+        stream_state = state.get(stream_id)
+        if not stream_state:
+            return jsonify({'success': False, 'error': 'Stream not found'}), 404
+
+        pid = stream_state.get('pid')
+        if pid:
             try:
-                with open(STREAM_STATE_FILE, 'w') as f:
-                    json.dump(state, f)
-            except:
+                os.kill(int(pid), signal.SIGTERM)
+            except ProcessLookupError:
+                # Process is already gone.
                 pass
-            return jsonify({'success': True, 'message': 'Stream stopped'})
-        return jsonify({'success': False, 'error': 'Stream not found'}), 404
+            except Exception as kill_error:
+                return jsonify({
+                    'success': False,
+                    'error': f'Unable to stop external stream process: {kill_error}'
+                }), 500
+
+        del state[stream_id]
+        write_stream_state_snapshot(state)
+        return jsonify({'success': True, 'message': 'Stream stopped'})
 
     stream.stop()
     del active_streams[stream_id]
@@ -335,7 +524,6 @@ def stream_status(stream_id):
     stream = active_streams.get(stream_id)
 
     if not stream:
-        # Try loading from state file for multi-worker support
         state = load_stream_state()
         if stream_id in state:
             stream_state = state[stream_id]
@@ -345,9 +533,15 @@ def stream_status(stream_id):
                 'is_running': stream_state.get('is_running', False),
                 'source': stream_state.get('source', ''),
                 'started_at': stream_state.get('started_at'),
-                'log': stream_state.get('log', [])
+                'log': stream_state.get('log', []),
+                'pid': stream_state.get('pid'),
+                'restart_attempts': stream_state.get('restart_attempts', 0),
+                'max_restarts': stream_state.get('max_restarts', 0)
             })
         return jsonify({'success': False, 'error': 'Stream not found'}), 404
+
+    stream.refresh_runtime_status()
+    save_stream_state(active_streams)
 
     return jsonify({
         'success': True,
@@ -355,23 +549,115 @@ def stream_status(stream_id):
         'is_running': stream.is_running(),
         'source': stream.source,
         'started_at': stream.started_at.isoformat() if stream.started_at else None,
-        'log': stream.log[-10:]
+        'log': stream.get_recent_log(20),
+        'pid': stream.pid,
+        'restart_attempts': stream.restart_attempts,
+        'max_restarts': stream.max_restarts
     })
 
 
 @app.route('/api/streams', methods=['GET'])
 def list_streams():
     """List all active streams."""
-    streams = []
+    streams = {}
     for stream_id, stream in active_streams.items():
-        streams.append({
+        stream.refresh_runtime_status()
+        streams[stream_id] = {
             'id': stream_id,
             'status': stream.status,
             'is_running': stream.is_running(),
             'source': stream.source,
-            'started_at': stream.started_at.isoformat() if stream.started_at else None
+            'started_at': stream.started_at.isoformat() if stream.started_at else None,
+            'pid': stream.pid,
+            'restart_attempts': stream.restart_attempts,
+            'max_restarts': stream.max_restarts
+        }
+
+    state = load_stream_state()
+    for stream_id, stream_state in state.items():
+        if stream_id in streams:
+            continue
+        streams[stream_id] = {
+            'id': stream_id,
+            'status': stream_state.get('status', 'unknown'),
+            'is_running': stream_state.get('is_running', False),
+            'source': stream_state.get('source', ''),
+            'started_at': stream_state.get('started_at'),
+            'pid': stream_state.get('pid'),
+            'restart_attempts': stream_state.get('restart_attempts', 0),
+            'max_restarts': stream_state.get('max_restarts', 0)
+        }
+
+    save_stream_state(active_streams)
+    return jsonify({'success': True, 'streams': list(streams.values())})
+
+
+@app.route('/api/health', methods=['GET'])
+def health_status():
+    """Return service and stream health metrics."""
+    stream_states = collect_stream_states()
+    streams = list(stream_states.values())
+
+    status_counts = {
+        'running': 0,
+        'starting': 0,
+        'restarting': 0,
+        'stopped': 0,
+        'error': 0,
+        'unknown': 0
+    }
+
+    restart_total = 0
+    stream_metrics = []
+    now = datetime.now()
+
+    for stream in streams:
+        status = stream.get('status', 'unknown')
+        if status not in status_counts:
+            status = 'unknown'
+        status_counts[status] += 1
+
+        restart_attempts = int(stream.get('restart_attempts', 0) or 0)
+        restart_total += restart_attempts
+
+        started_at = stream.get('started_at')
+        uptime_seconds = None
+        if started_at:
+            try:
+                started_dt = datetime.fromisoformat(started_at)
+                uptime_seconds = max(int((now - started_dt).total_seconds()), 0)
+            except ValueError:
+                uptime_seconds = None
+
+        log_entries = stream.get('log', [])
+        last_log = log_entries[-1] if log_entries else ''
+
+        stream_metrics.append({
+            'id': stream.get('id'),
+            'status': stream.get('status', 'unknown'),
+            'is_running': stream.get('is_running', False),
+            'source': stream.get('source', ''),
+            'source_type': stream.get('source_type', ''),
+            'pid': stream.get('pid'),
+            'worker_pid': stream.get('worker_pid'),
+            'started_at': started_at,
+            'uptime_seconds': uptime_seconds,
+            'restart_attempts': restart_attempts,
+            'max_restarts': int(stream.get('max_restarts', 0) or 0),
+            'last_log': last_log
         })
-    return jsonify({'success': True, 'streams': streams})
+
+    response = {
+        'success': True,
+        'server_time': datetime.utcnow().isoformat() + 'Z',
+        'worker_pid': WORKER_PID,
+        'ffmpeg_available': shutil.which('ffmpeg') is not None,
+        'total_streams': len(streams),
+        'status_counts': status_counts,
+        'restart_total': restart_total,
+        'streams': stream_metrics
+    }
+    return jsonify(response)
 
 
 @app.route('/api/upload', methods=['POST'])
@@ -454,34 +740,86 @@ iptv_playlist_url = None
 import json
 import tempfile
 STREAM_STATE_FILE = os.path.join(tempfile.gettempdir(), 'youtubelive_streams.json')
+state_file_lock = threading.Lock()
+WORKER_PID = os.getpid()
+
+
+def stream_to_state(stream_id, stream):
+    """Serialize stream object into a transport-safe dictionary."""
+    stream.refresh_runtime_status()
+    return {
+        'id': stream_id,
+        'status': stream.status,
+        'source': stream.source,
+        'source_type': stream.source_type,
+        'started_at': stream.started_at.isoformat() if stream.started_at else None,
+        'log': stream.get_recent_log(20),
+        'is_running': stream.is_running(),
+        'pid': stream.pid,
+        'worker_pid': WORKER_PID,
+        'restart_attempts': stream.restart_attempts,
+        'max_restarts': stream.max_restarts
+    }
+
+
+def write_stream_state_snapshot(state):
+    """Atomically write stream state snapshot to disk."""
+    try:
+        with state_file_lock:
+            temp_file = f"{STREAM_STATE_FILE}.tmp"
+            with open(temp_file, 'w', encoding='utf-8') as f:
+                json.dump(state, f)
+            os.replace(temp_file, STREAM_STATE_FILE)
+    except Exception as e:
+        print(f"Error writing stream state snapshot: {e}")
 
 def save_stream_state(streams):
     """Save stream state to file for sharing between workers."""
+    local_state = {}
+    for stream_id, stream in streams.items():
+        local_state[stream_id] = stream_to_state(stream_id, stream)
+
     try:
-        state = {}
-        for stream_id, stream in streams.items():
-            state[stream_id] = {
-                'id': stream_id,
-                'status': stream.status,
-                'source': stream.source,
-                'started_at': stream.started_at.isoformat() if stream.started_at else None,
-                'log': stream.log[-10:],
-                'is_running': stream.is_running()
-            }
-        with open(STREAM_STATE_FILE, 'w') as f:
-            json.dump(state, f)
+        with state_file_lock:
+            existing = {}
+            if os.path.exists(STREAM_STATE_FILE):
+                with open(STREAM_STATE_FILE, 'r', encoding='utf-8') as f:
+                    existing = json.load(f)
+
+            merged_state = {}
+            for stream_id, stream_state in existing.items():
+                if str(stream_state.get('worker_pid')) != str(WORKER_PID):
+                    merged_state[stream_id] = stream_state
+
+            merged_state.update(local_state)
+            temp_file = f"{STREAM_STATE_FILE}.tmp"
+            with open(temp_file, 'w', encoding='utf-8') as f:
+                json.dump(merged_state, f)
+            os.replace(temp_file, STREAM_STATE_FILE)
     except Exception as e:
         print(f"Error saving stream state: {e}")
 
 def load_stream_state():
     """Load stream state from file."""
     try:
-        if os.path.exists(STREAM_STATE_FILE):
-            with open(STREAM_STATE_FILE, 'r') as f:
-                return json.load(f)
+        with state_file_lock:
+            if os.path.exists(STREAM_STATE_FILE):
+                with open(STREAM_STATE_FILE, 'r', encoding='utf-8') as f:
+                    return json.load(f)
     except Exception as e:
         print(f"Error loading stream state: {e}")
     return {}
+
+
+def collect_stream_states():
+    """Collect merged stream states from local process and shared state file."""
+    local_states = {}
+    for stream_id, stream in active_streams.items():
+        local_states[stream_id] = stream_to_state(stream_id, stream)
+
+    merged_states = load_stream_state()
+    merged_states.update(local_states)
+    return merged_states
 
 
 # ==================== IPTV Endpoints ====================
@@ -694,3 +1032,4 @@ if __name__ == '__main__':
     print("\n" + "="*50 + "\n")
 
     app.run(host='0.0.0.0', port=port, debug=debug)
+

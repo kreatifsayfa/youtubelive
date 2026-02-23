@@ -372,6 +372,109 @@ header .subtitle {
     color: var(--error);
 }
 
+/* Health Card */
+.health-summary {
+    display: grid;
+    grid-template-columns: repeat(auto-fit, minmax(140px, 1fr));
+    gap: 12px;
+    margin-bottom: 15px;
+}
+
+.health-metric {
+    background: var(--bg-tertiary);
+    border: 1px solid var(--border);
+    border-radius: 8px;
+    padding: 12px;
+}
+
+.health-label {
+    display: block;
+    color: var(--text-secondary);
+    font-size: 0.8rem;
+    margin-bottom: 4px;
+}
+
+.health-value {
+    font-size: 1.2rem;
+    font-weight: 700;
+}
+
+.health-badge {
+    display: inline-block;
+    padding: 4px 10px;
+    border-radius: 999px;
+    font-size: 0.8rem;
+    font-weight: 700;
+}
+
+.health-badge.ok {
+    background: rgba(76, 175, 80, 0.2);
+    color: var(--success);
+}
+
+.health-badge.warn {
+    background: rgba(255, 152, 0, 0.2);
+    color: var(--warning);
+}
+
+.health-badge.error {
+    background: rgba(244, 67, 54, 0.2);
+    color: var(--error);
+}
+
+.health-meta {
+    display: flex;
+    justify-content: space-between;
+    gap: 15px;
+    margin-bottom: 15px;
+    font-size: 0.9rem;
+    color: var(--text-secondary);
+    flex-wrap: wrap;
+}
+
+.health-streams-list {
+    background: var(--bg-tertiary);
+    border-radius: 8px;
+    border: 1px solid var(--border);
+    overflow: hidden;
+}
+
+.health-stream-row {
+    display: grid;
+    grid-template-columns: minmax(220px, 2fr) minmax(90px, 1fr) minmax(80px, 1fr) minmax(70px, 1fr) minmax(90px, 1fr);
+    gap: 10px;
+    padding: 10px 12px;
+    align-items: center;
+    border-bottom: 1px solid var(--border);
+    font-size: 0.9rem;
+}
+
+.health-stream-row:last-child {
+    border-bottom: none;
+}
+
+.health-stream-row.header {
+    background: rgba(255, 255, 255, 0.03);
+    color: var(--text-secondary);
+    font-weight: 600;
+}
+
+.health-stream-source {
+    white-space: nowrap;
+    overflow: hidden;
+    text-overflow: ellipsis;
+}
+
+.health-stream-status {
+    justify-self: start;
+}
+
+.health-empty {
+    padding: 12px;
+    color: var(--text-secondary);
+    font-size: 0.9rem;
+}
+
 /* Notifications */
 .notification {
     position: fixed;
@@ -536,5 +639,10 @@ header .subtitle {
 
     .stream-status {
         grid-template-columns: 1fr;
+    }
+
+    .health-stream-row {
+        grid-template-columns: 1fr;
+        gap: 4px;
     }
 }

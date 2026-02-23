@@ -154,10 +154,40 @@
                 <div class="stream-log" id="streamLog"></div>
             </section>
 
-            <!-- Active Streams List -->
-            <section class="card" id="streamsListCard" style="display: none;">
-                <h2>Aktif Yayınlar</h2>
-                <div id="streamsList"></div>
+            <!-- Health Metrics -->
+            <section class="card" id="healthCard">
+                <h2>Sistem Sagligi</h2>
+                <div class="health-summary">
+                    <div class="health-metric">
+                        <span class="health-label">FFmpeg</span>
+                        <span id="ffmpegHealthBadge" class="health-badge warn">Kontrol Ediliyor</span>
+                    </div>
+                    <div class="health-metric">
+                        <span class="health-label">Toplam Yayin</span>
+                        <span id="healthTotalStreams" class="health-value">0</span>
+                    </div>
+                    <div class="health-metric">
+                        <span class="health-label">Running</span>
+                        <span id="healthRunningStreams" class="health-value">0</span>
+                    </div>
+                    <div class="health-metric">
+                        <span class="health-label">Restarting</span>
+                        <span id="healthRestartingStreams" class="health-value">0</span>
+                    </div>
+                    <div class="health-metric">
+                        <span class="health-label">Error</span>
+                        <span id="healthErrorStreams" class="health-value">0</span>
+                    </div>
+                    <div class="health-metric">
+                        <span class="health-label">Toplam Restart</span>
+                        <span id="healthRestartTotal" class="health-value">0</span>
+                    </div>
+                </div>
+                <div class="health-meta">
+                    <span>Worker PID: <strong id="healthWorkerPid">-</strong></span>
+                    <span>Son Guncelleme: <strong id="healthLastUpdated">-</strong></span>
+                </div>
+                <div id="healthStreamsList" class="health-streams-list"></div>
             </section>
         </div>
     </div>
@@ -165,3 +195,4 @@
     <script src="/static/script.js"></script>
 </body>
 </html>
+
