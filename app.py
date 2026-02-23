@@ -14,7 +14,7 @@ import shutil
 import threading
 from collections import deque
 from datetime import datetime
-from urllib.parse import urlparse
+from urllib.parse import urlparse, urljoin
 from flask import Flask, render_template, request, jsonify
 from werkzeug.utils import secure_filename
 from m3u_parser import M3UParser
@@ -68,6 +68,8 @@ class StreamProcess:
         self.current_cmd = []
         self.fallback_cmd = []
         self.using_fallback = False
+        self.source_cookies = None
+        self.source_input_url = None
         self.auto_restart = False
         self.max_restarts = int(os.environ.get('STREAM_MAX_RESTARTS', 5))
         self.restart_backoff_seconds = int(os.environ.get('STREAM_RESTART_BACKOFF', 3))
@@ -174,12 +176,19 @@ class StreamProcess:
         except Exception:
             return None
 
-    def _build_network_input_options(self, source_url, compatibility=False):
+    def _build_network_input_options(self, source_url, compatibility=False, cookie_header=None):
         """Build FFmpeg input options for network streams."""
-        options = ['-re', '-thread_queue_size', '1024', '-user_agent', DEFAULT_INPUT_USER_AGENT]
+        options = [
+            '-re',
+            '-thread_queue_size', '1024',
+            '-user_agent', DEFAULT_INPUT_USER_AGENT,
+            '-protocol_whitelist', 'file,http,https,tcp,tls,crypto'
+        ]
         headers = self._build_source_headers(source_url)
         if headers:
             options.extend(['-headers', headers])
+        if cookie_header:
+            options.extend(['-cookies', cookie_header])
 
         if not compatibility:
             options.extend([
@@ -189,10 +198,45 @@ class StreamProcess:
                 '-reconnect_at_eof', '1',
                 '-reconnect_delay_max', '8'
             ])
+        else:
+            options.extend(['-http_persistent', '0'])
         return options
 
     def _validate_m3u8_source(self, m3u8_url):
-        """Preflight-check M3U8 URL so empty/protected playlists fail fast."""
+        """Preflight-check M3U8 URL and resolve a stable playable input URL."""
+        def parse_hls(content, base_url):
+            lines = [line.strip() for line in (content or '').splitlines() if line.strip()]
+            variants = []
+            segments = []
+
+            for idx, line in enumerate(lines):
+                if line.startswith('#EXT-X-STREAM-INF'):
+                    bandwidth = 0
+                    bandwidth_match = re.search(r'BANDWIDTH=(\d+)', line)
+                    if bandwidth_match:
+                        try:
+                            bandwidth = int(bandwidth_match.group(1))
+                        except ValueError:
+                            bandwidth = 0
+
+                    for next_line in lines[idx + 1:]:
+                        if next_line.startswith('#'):
+                            continue
+                        variants.append({
+                            'url': urljoin(base_url, next_line),
+                            'bandwidth': bandwidth
+                        })
+                        break
+                elif not line.startswith('#'):
+                    segments.append(urljoin(base_url, line))
+
+            is_master = bool(variants)
+            return {
+                'is_master': is_master,
+                'variants': variants,
+                'segments': segments
+            }
+
         try:
             response = requests.get(
                 m3u8_url,
@@ -202,23 +246,63 @@ class StreamProcess:
             )
             response.raise_for_status()
             content = response.text or ''
+            effective_url = response.url or m3u8_url
+            cookie_header = '; '.join([f'{k}={v}' for k, v in response.cookies.items()]) or None
 
             if '#EXTM3U' not in content:
-                return False, 'M3U8 kaynagi gecersiz: #EXTM3U basligi bulunamadi.'
+                return False, 'M3U8 kaynagi gecersiz: #EXTM3U basligi bulunamadi.', None
 
-            lines = [line.strip() for line in content.splitlines() if line.strip()]
-            stream_markers = ('#EXTINF', '#EXT-X-STREAM-INF')
-            has_marker = any(line.startswith(stream_markers) for line in lines)
-            has_non_comment_uri = any(not line.startswith('#') for line in lines)
+            hls_info = parse_hls(content, effective_url)
+            has_segments = len(hls_info['segments']) > 0
+            has_variants = len(hls_info['variants']) > 0
 
-            if not has_marker and not has_non_comment_uri:
+            resolved_input_url = effective_url
+
+            if has_variants and not has_segments:
+                selected = sorted(
+                    hls_info['variants'],
+                    key=lambda x: x.get('bandwidth', 0),
+                    reverse=True
+                )[0]
+                candidate_url = selected['url']
+                try:
+                    variant_response = requests.get(
+                        candidate_url,
+                        headers={'User-Agent': DEFAULT_INPUT_USER_AGENT},
+                        timeout=12,
+                        allow_redirects=True
+                    )
+                    variant_response.raise_for_status()
+                    variant_content = variant_response.text or ''
+                    if '#EXTM3U' not in variant_content:
+                        return False, 'Master playlist variant gecersiz m3u8 dondurdu.', None
+
+                    variant_info = parse_hls(variant_content, variant_response.url or candidate_url)
+                    if len(variant_info['segments']) == 0:
+                        return False, (
+                            'M3U8 kaynagi playlist donduruyor ama segment listesi bos. '
+                            'Kaynak aktif degil veya erisim kisitli.'
+                        ), None
+                    resolved_input_url = variant_response.url or candidate_url
+                    variant_cookie_header = '; '.join(
+                        [f'{k}={v}' for k, v in variant_response.cookies.items()]
+                    ) or None
+                    cookie_header = variant_cookie_header or cookie_header
+                except Exception as variant_error:
+                    return False, f'Variant playlist dogrulamasi basarisiz: {variant_error}', None
+
+            elif not has_segments and not has_variants:
                 return False, (
                     'M3U8 playlist bos veya korumali gorunuyor. '
                     'Direkt stream URL kullandiginizdan emin olun.'
-                )
-            return True, ''
+                ), None
+
+            return True, '', {
+                'resolved_input_url': resolved_input_url,
+                'cookie_header': cookie_header
+            }
         except Exception as e:
-            return False, f'M3U8 kaynak dogrulamasi basarisiz: {e}'
+            return False, f'M3U8 kaynak dogrulamasi basarisiz: {e}', None
 
     def start_m3u8(self, m3u8_url, youtube_key, quality='1080p'):
         """Start streaming from M3U8 URL to YouTube."""
@@ -230,23 +314,32 @@ class StreamProcess:
         self.auto_restart = True
         self.restart_attempts = 0
         self.using_fallback = False
+        self.source_input_url = None
+        self.source_cookies = None
         bitrate = self._get_bitrate(quality)
 
-        is_valid, validation_error = self._validate_m3u8_source(m3u8_url)
+        is_valid, validation_error, preflight = self._validate_m3u8_source(m3u8_url)
         if not is_valid:
             self.status = 'error'
             self.last_error = validation_error
             self._append_log(validation_error)
             return False, validation_error
 
+        self.source_input_url = preflight.get('resolved_input_url') if preflight else m3u8_url
+        self.source_cookies = preflight.get('cookie_header') if preflight else None
+
         rtmp_url = f"rtmp://a.rtmp.youtube.com/live2/{youtube_key}"
 
-        input_options = self._build_network_input_options(m3u8_url, compatibility=False)
-        compat_input_options = self._build_network_input_options(m3u8_url, compatibility=True)
+        input_options = self._build_network_input_options(
+            self.source_input_url, compatibility=False, cookie_header=self.source_cookies
+        )
+        compat_input_options = self._build_network_input_options(
+            self.source_input_url, compatibility=True, cookie_header=self.source_cookies
+        )
 
-        cmd = self._build_ffmpeg_cmd(input_options, m3u8_url, bitrate, rtmp_url)
+        cmd = self._build_ffmpeg_cmd(input_options, self.source_input_url, bitrate, rtmp_url)
         self.fallback_cmd = self._build_compat_ffmpeg_cmd(
-            compat_input_options, m3u8_url, bitrate, rtmp_url
+            compat_input_options, self.source_input_url, bitrate, rtmp_url
         )
 
         return self._start_process(cmd)
@@ -261,6 +354,8 @@ class StreamProcess:
         self.auto_restart = True
         self.restart_attempts = 0
         self.using_fallback = False
+        self.source_input_url = None
+        self.source_cookies = None
 
         if not HAS_YTDLP:
             self.status = 'error'
@@ -315,6 +410,8 @@ class StreamProcess:
         self.auto_restart = False
         self.restart_attempts = 0
         self.using_fallback = False
+        self.source_input_url = None
+        self.source_cookies = None
 
         bitrate = self._get_bitrate(quality)
         rtmp_url = f"rtmp://a.rtmp.youtube.com/live2/{youtube_key}"
@@ -636,6 +733,7 @@ def stream_status(stream_id):
                 'status': stream_state.get('status', 'unknown'),
                 'is_running': stream_state.get('is_running', False),
                 'source': stream_state.get('source', ''),
+                'source_input_url': stream_state.get('source_input_url'),
                 'started_at': stream_state.get('started_at'),
                 'log': stream_state.get('log', []),
                 'pid': stream_state.get('pid'),
@@ -654,6 +752,7 @@ def stream_status(stream_id):
         'status': stream.status,
         'is_running': stream.is_running(),
         'source': stream.source,
+        'source_input_url': stream.source_input_url,
         'started_at': stream.started_at.isoformat() if stream.started_at else None,
         'log': stream.get_recent_log(20),
         'pid': stream.pid,
@@ -675,6 +774,7 @@ def list_streams():
             'status': stream.status,
             'is_running': stream.is_running(),
             'source': stream.source,
+            'source_input_url': stream.source_input_url,
             'started_at': stream.started_at.isoformat() if stream.started_at else None,
             'pid': stream.pid,
             'last_error': stream.last_error,
@@ -692,6 +792,7 @@ def list_streams():
             'status': stream_state.get('status', 'unknown'),
             'is_running': stream_state.get('is_running', False),
             'source': stream_state.get('source', ''),
+            'source_input_url': stream_state.get('source_input_url'),
             'started_at': stream_state.get('started_at'),
             'pid': stream_state.get('pid'),
             'last_error': stream_state.get('last_error'),
@@ -749,6 +850,7 @@ def health_status():
             'status': stream.get('status', 'unknown'),
             'is_running': stream.get('is_running', False),
             'source': stream.get('source', ''),
+            'source_input_url': stream.get('source_input_url'),
             'source_type': stream.get('source_type', ''),
             'pid': stream.get('pid'),
             'worker_pid': stream.get('worker_pid'),
@@ -865,6 +967,7 @@ def stream_to_state(stream_id, stream):
         'id': stream_id,
         'status': stream.status,
         'source': stream.source,
+        'source_input_url': stream.source_input_url,
         'source_type': stream.source_type,
         'started_at': stream.started_at.isoformat() if stream.started_at else None,
         'log': stream.get_recent_log(20),
