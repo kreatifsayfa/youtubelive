@@ -14,9 +14,11 @@ import shutil
 import threading
 from collections import deque
 from datetime import datetime
+from urllib.parse import urlparse
 from flask import Flask, render_template, request, jsonify
 from werkzeug.utils import secure_filename
 from m3u_parser import M3UParser
+import requests
 
 try:
     import yt_dlp
@@ -41,6 +43,11 @@ BITRATE_MAP = {
     '1440p': '9000k',
     '2160p': '18000k'
 }
+DEFAULT_INPUT_USER_AGENT = os.environ.get(
+    'STREAM_INPUT_USER_AGENT',
+    'Mozilla/5.0 (Windows NT 10.0; Win64; x64) AppleWebKit/537.36 '
+    '(KHTML, like Gecko) Chrome/122.0.0.0 Safari/537.36'
+)
 
 
 class StreamProcess:
@@ -59,6 +66,8 @@ class StreamProcess:
         self.started_at = None
         self.log = deque(maxlen=200)
         self.current_cmd = []
+        self.fallback_cmd = []
+        self.using_fallback = False
         self.auto_restart = False
         self.max_restarts = int(os.environ.get('STREAM_MAX_RESTARTS', 5))
         self.restart_backoff_seconds = int(os.environ.get('STREAM_RESTART_BACKOFF', 3))
@@ -108,8 +117,8 @@ class StreamProcess:
         """Build a resilient FFmpeg command for YouTube RTMP output."""
         command = ['ffmpeg', '-hide_banner', '-nostats', '-loglevel', 'info']
         command.extend(input_options)
+        command.extend(['-i', source_input])
         command.extend([
-            '-i', source_input,
             '-map', '0:v:0',
             '-map', '0:a:0?',
             '-c:v', 'libx264',
@@ -132,6 +141,85 @@ class StreamProcess:
         ])
         return command
 
+    def _build_compat_ffmpeg_cmd(self, input_options, source_input, bitrate, rtmp_url):
+        """Build compatibility-focused FFmpeg command for older builds/sources."""
+        command = ['ffmpeg', '-hide_banner', '-loglevel', 'info']
+        command.extend(input_options)
+        command.extend([
+            '-i', source_input,
+            '-c:v', 'libx264',
+            '-preset', 'veryfast',
+            '-b:v', bitrate,
+            '-maxrate', bitrate,
+            '-bufsize', f'{int(bitrate[:-1]) * 2}k',
+            '-pix_fmt', 'yuv420p',
+            '-g', '50',
+            '-c:a', 'aac',
+            '-b:a', '128k',
+            '-ar', '44100',
+            '-ac', '2',
+            '-f', 'flv',
+            rtmp_url
+        ])
+        return command
+
+    def _build_source_headers(self, source_url):
+        """Build optional HTTP headers for source hosts requiring referer/origin."""
+        try:
+            parsed = urlparse(source_url)
+            if not parsed.scheme or not parsed.netloc:
+                return None
+            origin = f'{parsed.scheme}://{parsed.netloc}'
+            return f'Referer: {origin}/\r\nOrigin: {origin}\r\n'
+        except Exception:
+            return None
+
+    def _build_network_input_options(self, source_url, compatibility=False):
+        """Build FFmpeg input options for network streams."""
+        options = ['-re', '-thread_queue_size', '1024', '-user_agent', DEFAULT_INPUT_USER_AGENT]
+        headers = self._build_source_headers(source_url)
+        if headers:
+            options.extend(['-headers', headers])
+
+        if not compatibility:
+            options.extend([
+                '-rw_timeout', '15000000',
+                '-reconnect', '1',
+                '-reconnect_streamed', '1',
+                '-reconnect_at_eof', '1',
+                '-reconnect_delay_max', '8'
+            ])
+        return options
+
+    def _validate_m3u8_source(self, m3u8_url):
+        """Preflight-check M3U8 URL so empty/protected playlists fail fast."""
+        try:
+            response = requests.get(
+                m3u8_url,
+                headers={'User-Agent': DEFAULT_INPUT_USER_AGENT},
+                timeout=12,
+                allow_redirects=True
+            )
+            response.raise_for_status()
+            content = response.text or ''
+
+            if '#EXTM3U' not in content:
+                return False, 'M3U8 kaynagi gecersiz: #EXTM3U basligi bulunamadi.'
+
+            lines = [line.strip() for line in content.splitlines() if line.strip()]
+            stream_markers = ('#EXTINF', '#EXT-X-STREAM-INF')
+            has_marker = any(line.startswith(stream_markers) for line in lines)
+            has_non_comment_uri = any(not line.startswith('#') for line in lines)
+
+            if not has_marker and not has_non_comment_uri:
+                return False, (
+                    'M3U8 playlist bos veya korumali gorunuyor. '
+                    'Direkt stream URL kullandiginizdan emin olun.'
+                )
+            return True, ''
+        except Exception as e:
+            return False, f'M3U8 kaynak dogrulamasi basarisiz: {e}'
+
     def start_m3u8(self, m3u8_url, youtube_key, quality='1080p'):
         """Start streaming from M3U8 URL to YouTube."""
         self.source = m3u8_url
@@ -141,20 +229,25 @@ class StreamProcess:
         self.status = 'starting'
         self.auto_restart = True
         self.restart_attempts = 0
+        self.using_fallback = False
         bitrate = self._get_bitrate(quality)
+
+        is_valid, validation_error = self._validate_m3u8_source(m3u8_url)
+        if not is_valid:
+            self.status = 'error'
+            self.last_error = validation_error
+            self._append_log(validation_error)
+            return False, validation_error
 
         rtmp_url = f"rtmp://a.rtmp.youtube.com/live2/{youtube_key}"
 
-        input_options = [
-            '-re',
-            '-thread_queue_size', '1024',
-            '-rw_timeout', '15000000',
-            '-reconnect', '1',
-            '-reconnect_streamed', '1',
-            '-reconnect_at_eof', '1',
-            '-reconnect_delay_max', '8'
-        ]
+        input_options = self._build_network_input_options(m3u8_url, compatibility=False)
+        compat_input_options = self._build_network_input_options(m3u8_url, compatibility=True)
+
         cmd = self._build_ffmpeg_cmd(input_options, m3u8_url, bitrate, rtmp_url)
+        self.fallback_cmd = self._build_compat_ffmpeg_cmd(
+            compat_input_options, m3u8_url, bitrate, rtmp_url
+        )
 
         return self._start_process(cmd)
 
@@ -167,6 +260,7 @@ class StreamProcess:
         self.status = 'starting'
         self.auto_restart = True
         self.restart_attempts = 0
+        self.using_fallback = False
 
         if not HAS_YTDLP:
             self.status = 'error'
@@ -201,16 +295,13 @@ class StreamProcess:
         bitrate = self._get_bitrate(quality)
         rtmp_url = f"rtmp://a.rtmp.youtube.com/live2/{youtube_key}"
 
-        input_options = [
-            '-re',
-            '-thread_queue_size', '1024',
-            '-rw_timeout', '15000000',
-            '-reconnect', '1',
-            '-reconnect_streamed', '1',
-            '-reconnect_at_eof', '1',
-            '-reconnect_delay_max', '8'
-        ]
+        input_options = self._build_network_input_options(stream_url, compatibility=False)
+        compat_input_options = self._build_network_input_options(stream_url, compatibility=True)
+
         cmd = self._build_ffmpeg_cmd(input_options, stream_url, bitrate, rtmp_url)
+        self.fallback_cmd = self._build_compat_ffmpeg_cmd(
+            compat_input_options, stream_url, bitrate, rtmp_url
+        )
 
         return self._start_process(cmd)
 
@@ -223,6 +314,7 @@ class StreamProcess:
         self.status = 'starting'
         self.auto_restart = False
         self.restart_attempts = 0
+        self.using_fallback = False
 
         bitrate = self._get_bitrate(quality)
         rtmp_url = f"rtmp://a.rtmp.youtube.com/live2/{youtube_key}"
@@ -235,6 +327,7 @@ class StreamProcess:
             input_options.extend(['-stream_loop', '-1'])
 
         cmd = self._build_ffmpeg_cmd(input_options, file_path, bitrate, rtmp_url)
+        self.fallback_cmd = self._build_compat_ffmpeg_cmd(input_options, file_path, bitrate, rtmp_url)
 
         return self._start_process(cmd)
 
@@ -322,6 +415,17 @@ class StreamProcess:
         self.status = 'error'
         self.last_error = f'FFmpeg exited with code {exit_code}'
         self._append_log(self.last_error)
+
+        if self.fallback_cmd and not self.using_fallback:
+            self.using_fallback = True
+            self.current_cmd = list(self.fallback_cmd)
+            self.status = 'restarting'
+            self._append_log(
+                'Primary FFmpeg profili basarisiz oldu, compatibility profile geciliyor'
+            )
+            if not self.stop_event.wait(1):
+                self._restart_process()
+            return
 
         if self.auto_restart and self.restart_attempts < self.max_restarts:
             self.restart_attempts += 1
@@ -535,6 +639,8 @@ def stream_status(stream_id):
                 'started_at': stream_state.get('started_at'),
                 'log': stream_state.get('log', []),
                 'pid': stream_state.get('pid'),
+                'last_error': stream_state.get('last_error'),
+                'using_fallback': stream_state.get('using_fallback', False),
                 'restart_attempts': stream_state.get('restart_attempts', 0),
                 'max_restarts': stream_state.get('max_restarts', 0)
             })
@@ -551,6 +657,8 @@ def stream_status(stream_id):
         'started_at': stream.started_at.isoformat() if stream.started_at else None,
         'log': stream.get_recent_log(20),
         'pid': stream.pid,
+        'last_error': stream.last_error,
+        'using_fallback': stream.using_fallback,
         'restart_attempts': stream.restart_attempts,
         'max_restarts': stream.max_restarts
     })
@@ -569,6 +677,8 @@ def list_streams():
             'source': stream.source,
             'started_at': stream.started_at.isoformat() if stream.started_at else None,
             'pid': stream.pid,
+            'last_error': stream.last_error,
+            'using_fallback': stream.using_fallback,
             'restart_attempts': stream.restart_attempts,
             'max_restarts': stream.max_restarts
         }
@@ -584,6 +694,8 @@ def list_streams():
             'source': stream_state.get('source', ''),
             'started_at': stream_state.get('started_at'),
             'pid': stream_state.get('pid'),
+            'last_error': stream_state.get('last_error'),
+            'using_fallback': stream_state.get('using_fallback', False),
             'restart_attempts': stream_state.get('restart_attempts', 0),
             'max_restarts': stream_state.get('max_restarts', 0)
         }
@@ -642,6 +754,8 @@ def health_status():
             'worker_pid': stream.get('worker_pid'),
             'started_at': started_at,
             'uptime_seconds': uptime_seconds,
+            'last_error': stream.get('last_error'),
+            'using_fallback': stream.get('using_fallback', False),
             'restart_attempts': restart_attempts,
             'max_restarts': int(stream.get('max_restarts', 0) or 0),
             'last_log': last_log
@@ -757,6 +871,8 @@ def stream_to_state(stream_id, stream):
         'is_running': stream.is_running(),
         'pid': stream.pid,
         'worker_pid': WORKER_PID,
+        'last_error': stream.last_error,
+        'using_fallback': stream.using_fallback,
         'restart_attempts': stream.restart_attempts,
         'max_restarts': stream.max_restarts
     }
