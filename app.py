@@ -48,19 +48,32 @@ DEFAULT_INPUT_USER_AGENT = os.environ.get(
     'Mozilla/5.0 (Windows NT 10.0; Win64; x64) AppleWebKit/537.36 '
     '(KHTML, like Gecko) Chrome/122.0.0.0 Safari/537.36'
 )
+HLS_PROXY_COOKIE_JAR = {}
+HLS_PROXY_LOCK = threading.Lock()
+
+
+def parse_cookie_header(cookie_header):
+    """Parse raw cookie header string into dict."""
+    cookie_map = {}
+    for part in (cookie_header or '').split(';'):
+        chunk = part.strip()
+        if not chunk or '=' not in chunk:
+            continue
+        key, value = chunk.split('=', 1)
+        cookie_map[key.strip()] = value.strip()
+    return cookie_map
+
+
+def merge_cookie_headers(base_cookie, override_cookie):
+    """Merge two raw cookie headers, override_cookie takes precedence."""
+    merged = parse_cookie_header(base_cookie)
+    merged.update(parse_cookie_header(override_cookie))
+    return '; '.join([f'{k}={v}' for k, v in merged.items()])
 
 
 def build_proxy_cookie_string(previous_cookie, response_cookies):
     """Merge previous cookie string and latest response cookies into one header string."""
-    cookie_map = {}
-
-    if previous_cookie:
-        for part in previous_cookie.split(';'):
-            chunk = part.strip()
-            if not chunk or '=' not in chunk:
-                continue
-            key, value = chunk.split('=', 1)
-            cookie_map[key.strip()] = value.strip()
+    cookie_map = parse_cookie_header(previous_cookie)
 
     if response_cookies:
         for key, value in response_cookies.items():
@@ -69,13 +82,15 @@ def build_proxy_cookie_string(previous_cookie, response_cookies):
     return '; '.join([f'{k}={v}' for k, v in cookie_map.items()])
 
 
-def build_hls_proxy_url(source_url, cookie_header=None):
+def build_hls_proxy_url(source_url, cookie_header=None, session_key=None):
     """Build local proxy URL so FFmpeg can consume HLS through Flask."""
     port = int(os.environ.get('PORT', 5000))
     base = f'http://127.0.0.1:{port}/api/hls-proxy'
     query = f'u={quote_plus(source_url)}'
     if cookie_header:
         query += f'&ck={quote_plus(cookie_header)}'
+    if session_key:
+        query += f'&sk={quote_plus(str(session_key))}'
     return f'{base}?{query}'
 
 
@@ -202,7 +217,8 @@ class StreamProcess:
             if not parsed.scheme or not parsed.netloc:
                 return None
             origin = f'{parsed.scheme}://{parsed.netloc}'
-            return f'Referer: {origin}/\r\nOrigin: {origin}\r\n'
+            referer = source_url
+            return f'Referer: {referer}\r\nOrigin: {origin}\r\n'
         except Exception:
             return None
 
@@ -382,7 +398,11 @@ class StreamProcess:
 
         resolved_url = preflight.get('resolved_input_url') if preflight else m3u8_url
         self.source_cookies = preflight.get('cookie_header') if preflight else None
-        self.source_input_url = build_hls_proxy_url(resolved_url, self.source_cookies)
+        self.source_input_url = build_hls_proxy_url(
+            resolved_url,
+            self.source_cookies,
+            session_key=self.stream_id
+        )
 
         rtmp_url = f"rtmp://a.rtmp.youtube.com/live2/{youtube_key}"
 
@@ -455,7 +475,7 @@ class StreamProcess:
         hls_tuning = self._is_hls_url(stream_url)
         input_url = stream_url
         if hls_tuning and stream_url.startswith(('http://', 'https://')):
-            input_url = build_hls_proxy_url(stream_url)
+            input_url = build_hls_proxy_url(stream_url, session_key=self.stream_id)
         self.source_input_url = input_url
 
         input_options = self._build_network_input_options(
@@ -722,6 +742,7 @@ def hls_proxy():
     """Proxy HLS playlists/segments to avoid FFmpeg HTTP quirks on some sources."""
     source_url = request.args.get('u', '').strip()
     cookie_header = request.args.get('ck', '').strip()
+    session_key = request.args.get('sk', '').strip()
 
     if not source_url:
         return jsonify({'success': False, 'error': 'Missing source URL'}), 400
@@ -729,7 +750,15 @@ def hls_proxy():
     if not source_url.startswith(('http://', 'https://')):
         return jsonify({'success': False, 'error': 'Invalid source URL'}), 400
 
-    upstream_headers = {'User-Agent': DEFAULT_INPUT_USER_AGENT}
+    parsed = urlparse(source_url)
+    jar_key = session_key or parsed.netloc
+
+    upstream_headers = {
+        'User-Agent': DEFAULT_INPUT_USER_AGENT,
+        'Accept': '*/*',
+        'Accept-Language': 'en-US,en;q=0.9',
+        'Connection': 'close'
+    }
     source_headers = StreamProcess._build_source_headers(source_url)
     if source_headers:
         for row in source_headers.splitlines():
@@ -737,8 +766,11 @@ def hls_proxy():
                 continue
             key, value = row.split(':', 1)
             upstream_headers[key.strip()] = value.strip()
-    if cookie_header:
-        upstream_headers['Cookie'] = cookie_header
+    with HLS_PROXY_LOCK:
+        stored_cookie = HLS_PROXY_COOKIE_JAR.get(jar_key, '')
+    seed_cookie = merge_cookie_headers(cookie_header, stored_cookie)
+    if seed_cookie:
+        upstream_headers['Cookie'] = seed_cookie
 
     try:
         upstream_response = requests.get(
@@ -759,7 +791,10 @@ def hls_proxy():
         or b'#EXTM3U' in body
     )
 
-    merged_cookie = build_proxy_cookie_string(cookie_header, upstream_response.cookies)
+    merged_cookie = build_proxy_cookie_string(seed_cookie, upstream_response.cookies)
+    if merged_cookie:
+        with HLS_PROXY_LOCK:
+            HLS_PROXY_COOKIE_JAR[jar_key] = merged_cookie
 
     if not is_playlist:
         return Response(
@@ -771,6 +806,7 @@ def hls_proxy():
     text = upstream_response.text or ''
     base_url = upstream_response.url or source_url
     out_lines = []
+    media_url_count = 0
 
     for line in text.splitlines():
         stripped = line.strip()
@@ -779,8 +815,18 @@ def hls_proxy():
             continue
 
         absolute_url = urljoin(base_url, stripped)
-        proxied_url = build_hls_proxy_url(absolute_url, merged_cookie)
+        proxied_url = build_hls_proxy_url(
+            absolute_url,
+            session_key=session_key or jar_key
+        )
         out_lines.append(proxied_url)
+        media_url_count += 1
+
+    if media_url_count == 0:
+        return jsonify({
+            'success': False,
+            'error': 'Upstream HLS playlist has no media URLs'
+        }), 502
 
     rewritten = '\n'.join(out_lines)
     return Response(
