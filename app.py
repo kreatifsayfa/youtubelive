@@ -14,8 +14,8 @@ import shutil
 import threading
 from collections import deque
 from datetime import datetime
-from urllib.parse import urlparse, urljoin
-from flask import Flask, render_template, request, jsonify
+from urllib.parse import urlparse, urljoin, quote_plus
+from flask import Flask, render_template, request, jsonify, Response
 from werkzeug.utils import secure_filename
 from m3u_parser import M3UParser
 import requests
@@ -48,6 +48,35 @@ DEFAULT_INPUT_USER_AGENT = os.environ.get(
     'Mozilla/5.0 (Windows NT 10.0; Win64; x64) AppleWebKit/537.36 '
     '(KHTML, like Gecko) Chrome/122.0.0.0 Safari/537.36'
 )
+
+
+def build_proxy_cookie_string(previous_cookie, response_cookies):
+    """Merge previous cookie string and latest response cookies into one header string."""
+    cookie_map = {}
+
+    if previous_cookie:
+        for part in previous_cookie.split(';'):
+            chunk = part.strip()
+            if not chunk or '=' not in chunk:
+                continue
+            key, value = chunk.split('=', 1)
+            cookie_map[key.strip()] = value.strip()
+
+    if response_cookies:
+        for key, value in response_cookies.items():
+            cookie_map[key] = value
+
+    return '; '.join([f'{k}={v}' for k, v in cookie_map.items()])
+
+
+def build_hls_proxy_url(source_url, cookie_header=None):
+    """Build local proxy URL so FFmpeg can consume HLS through Flask."""
+    port = int(os.environ.get('PORT', 5000))
+    base = f'http://127.0.0.1:{port}/api/hls-proxy'
+    query = f'u={quote_plus(source_url)}'
+    if cookie_header:
+        query += f'&ck={quote_plus(cookie_header)}'
+    return f'{base}?{query}'
 
 
 class StreamProcess:
@@ -165,7 +194,8 @@ class StreamProcess:
         ])
         return command
 
-    def _build_source_headers(self, source_url):
+    @staticmethod
+    def _build_source_headers(source_url):
         """Build optional HTTP headers for source hosts requiring referer/origin."""
         try:
             parsed = urlparse(source_url)
@@ -176,7 +206,20 @@ class StreamProcess:
         except Exception:
             return None
 
-    def _build_network_input_options(self, source_url, compatibility=False, cookie_header=None):
+    @staticmethod
+    def _is_hls_url(source_url):
+        if not source_url:
+            return False
+        lower_url = source_url.lower()
+        return '.m3u8' in lower_url or 'application/vnd.apple.mpegurl' in lower_url
+
+    def _build_network_input_options(
+        self,
+        source_url,
+        compatibility=False,
+        cookie_header=None,
+        hls_tuning=False
+    ):
         """Build FFmpeg input options for network streams."""
         options = [
             '-re',
@@ -189,6 +232,18 @@ class StreamProcess:
             options.extend(['-headers', headers])
         if cookie_header:
             options.extend(['-cookies', cookie_header])
+
+        if hls_tuning and not compatibility:
+            # HLS demuxer options from FFmpeg docs: reduce EOF/range loop issues.
+            options.extend([
+                '-live_start_index', '-3',
+                '-max_reload', '50',
+                '-m3u8_hold_counters', '50',
+                '-http_persistent', '0',
+                '-http_multiple', '0',
+                '-http_seekable', '0',
+                '-seg_max_retry', '6'
+            ])
 
         if not compatibility:
             options.extend([
@@ -325,16 +380,23 @@ class StreamProcess:
             self._append_log(validation_error)
             return False, validation_error
 
-        self.source_input_url = preflight.get('resolved_input_url') if preflight else m3u8_url
+        resolved_url = preflight.get('resolved_input_url') if preflight else m3u8_url
         self.source_cookies = preflight.get('cookie_header') if preflight else None
+        self.source_input_url = build_hls_proxy_url(resolved_url, self.source_cookies)
 
         rtmp_url = f"rtmp://a.rtmp.youtube.com/live2/{youtube_key}"
 
         input_options = self._build_network_input_options(
-            self.source_input_url, compatibility=False, cookie_header=self.source_cookies
+            self.source_input_url,
+            compatibility=False,
+            cookie_header=self.source_cookies,
+            hls_tuning=True
         )
         compat_input_options = self._build_network_input_options(
-            self.source_input_url, compatibility=True, cookie_header=self.source_cookies
+            self.source_input_url,
+            compatibility=True,
+            cookie_header=self.source_cookies,
+            hls_tuning=False
         )
 
         cmd = self._build_ffmpeg_cmd(input_options, self.source_input_url, bitrate, rtmp_url)
@@ -390,12 +452,26 @@ class StreamProcess:
         bitrate = self._get_bitrate(quality)
         rtmp_url = f"rtmp://a.rtmp.youtube.com/live2/{youtube_key}"
 
-        input_options = self._build_network_input_options(stream_url, compatibility=False)
-        compat_input_options = self._build_network_input_options(stream_url, compatibility=True)
+        hls_tuning = self._is_hls_url(stream_url)
+        input_url = stream_url
+        if hls_tuning and stream_url.startswith(('http://', 'https://')):
+            input_url = build_hls_proxy_url(stream_url)
+        self.source_input_url = input_url
 
-        cmd = self._build_ffmpeg_cmd(input_options, stream_url, bitrate, rtmp_url)
+        input_options = self._build_network_input_options(
+            input_url,
+            compatibility=False,
+            hls_tuning=hls_tuning
+        )
+        compat_input_options = self._build_network_input_options(
+            input_url,
+            compatibility=True,
+            hls_tuning=False
+        )
+
+        cmd = self._build_ffmpeg_cmd(input_options, input_url, bitrate, rtmp_url)
         self.fallback_cmd = self._build_compat_ffmpeg_cmd(
-            compat_input_options, stream_url, bitrate, rtmp_url
+            compat_input_options, input_url, bitrate, rtmp_url
         )
 
         return self._start_process(cmd)
@@ -423,6 +499,7 @@ class StreamProcess:
         if loop:
             input_options.extend(['-stream_loop', '-1'])
 
+        self.source_input_url = file_path
         cmd = self._build_ffmpeg_cmd(input_options, file_path, bitrate, rtmp_url)
         self.fallback_cmd = self._build_compat_ffmpeg_cmd(input_options, file_path, bitrate, rtmp_url)
 
@@ -638,6 +715,80 @@ def allowed_file(filename):
 def index():
     """Render main page."""
     return render_template('index.html')
+
+
+@app.route('/api/hls-proxy', methods=['GET'])
+def hls_proxy():
+    """Proxy HLS playlists/segments to avoid FFmpeg HTTP quirks on some sources."""
+    source_url = request.args.get('u', '').strip()
+    cookie_header = request.args.get('ck', '').strip()
+
+    if not source_url:
+        return jsonify({'success': False, 'error': 'Missing source URL'}), 400
+
+    if not source_url.startswith(('http://', 'https://')):
+        return jsonify({'success': False, 'error': 'Invalid source URL'}), 400
+
+    upstream_headers = {'User-Agent': DEFAULT_INPUT_USER_AGENT}
+    source_headers = StreamProcess._build_source_headers(source_url)
+    if source_headers:
+        for row in source_headers.splitlines():
+            if ':' not in row:
+                continue
+            key, value = row.split(':', 1)
+            upstream_headers[key.strip()] = value.strip()
+    if cookie_header:
+        upstream_headers['Cookie'] = cookie_header
+
+    try:
+        upstream_response = requests.get(
+            source_url,
+            headers=upstream_headers,
+            timeout=15,
+            allow_redirects=True
+        )
+        upstream_response.raise_for_status()
+    except Exception as e:
+        return jsonify({'success': False, 'error': f'HLS proxy upstream failed: {e}'}), 502
+
+    content_type = upstream_response.headers.get('Content-Type', '')
+    body = upstream_response.content or b''
+    is_playlist = (
+        'mpegurl' in content_type.lower()
+        or source_url.lower().endswith('.m3u8')
+        or b'#EXTM3U' in body
+    )
+
+    merged_cookie = build_proxy_cookie_string(cookie_header, upstream_response.cookies)
+
+    if not is_playlist:
+        return Response(
+            body,
+            status=upstream_response.status_code,
+            content_type=content_type or 'application/octet-stream'
+        )
+
+    text = upstream_response.text or ''
+    base_url = upstream_response.url or source_url
+    out_lines = []
+
+    for line in text.splitlines():
+        stripped = line.strip()
+        if not stripped or stripped.startswith('#'):
+            out_lines.append(line)
+            continue
+
+        absolute_url = urljoin(base_url, stripped)
+        proxied_url = build_hls_proxy_url(absolute_url, merged_cookie)
+        out_lines.append(proxied_url)
+
+    rewritten = '\n'.join(out_lines)
+    return Response(
+        rewritten,
+        status=200,
+        content_type='application/vnd.apple.mpegurl; charset=utf-8',
+        headers={'Cache-Control': 'no-cache, no-store, must-revalidate'}
+    )
 
 
 @app.route('/api/streams/start', methods=['POST'])
