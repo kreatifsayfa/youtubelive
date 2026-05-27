@@ -75,6 +75,12 @@ PUSHER_BACKOFF_MAX = float(os.environ.get('PUSHER_BACKOFF_MAX', '15.0'))
 RELAY_CHUNK_SIZE = int(os.environ.get('RELAY_CHUNK_SIZE', '65536'))
 SUPERVISOR_SELECT_TIMEOUT = float(os.environ.get('SUPERVISOR_SELECT_TIMEOUT', '0.4'))
 
+# HLS proxy: required for some IPTV providers (cookie/referer needs) but breaks
+# YouTube's 3-tier HLS structure (master -> per-quality -> segments). Default
+# YouTube to direct fetch.
+HLS_PROXY_FOR_YOUTUBE = os.environ.get('HLS_PROXY_FOR_YOUTUBE', 'false').lower() == 'true'
+HLS_PROXY_DISABLED = os.environ.get('HLS_PROXY_DISABLED', 'false').lower() == 'true'
+
 HLS_PROXY_COOKIE_JAR = {}
 HLS_PROXY_LOCK = threading.Lock()
 
@@ -818,9 +824,21 @@ class StreamProcess:
         preset = self._get_preset(quality)
         rtmp_url = f"rtmp://a.rtmp.youtube.com/live2/{youtube_key}"
         hls_tuning = self._is_hls_url(stream_url)
-        input_url = stream_url
-        if hls_tuning and stream_url.startswith(('http://', 'https://')):
-            input_url = build_hls_proxy_url(stream_url, session_key=self.stream_id)
+
+        # YouTube uses a 3-tier HLS structure that our internal proxy can't
+        # rewrite cleanly (it confuses per-quality playlist URLs with segment
+        # URLs and FFmpeg reports "Empty segment" for every variant). Bypass
+        # the proxy unless the operator explicitly enabled it via env var.
+        use_proxy = (
+            hls_tuning
+            and not HLS_PROXY_DISABLED
+            and HLS_PROXY_FOR_YOUTUBE
+            and stream_url.startswith(('http://', 'https://'))
+        )
+        input_url = (
+            build_hls_proxy_url(stream_url, session_key=self.stream_id)
+            if use_proxy else stream_url
+        )
         self.source_input_url = input_url
 
         input_options = self._build_network_input_options(
@@ -1280,9 +1298,16 @@ class StreamProcess:
         self.youtube_resolved_at = datetime.now()
 
         hls_tuning = self._is_hls_url(new_url)
-        input_url = new_url
-        if hls_tuning and new_url.startswith(('http://', 'https://')):
-            input_url = build_hls_proxy_url(new_url, session_key=self.stream_id)
+        use_proxy = (
+            hls_tuning
+            and not HLS_PROXY_DISABLED
+            and HLS_PROXY_FOR_YOUTUBE
+            and new_url.startswith(('http://', 'https://'))
+        )
+        input_url = (
+            build_hls_proxy_url(new_url, session_key=self.stream_id)
+            if use_proxy else new_url
+        )
         self.source_input_url = input_url
         input_options = self._build_network_input_options(
             input_url, compatibility=False, hls_tuning=hls_tuning
