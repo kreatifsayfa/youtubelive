@@ -316,6 +316,14 @@ class StreamProcess:
         self.bytes_relayed = 0
         self.loop_file = False
 
+        # YouTube-restream-specific metadata (populated when source_type=='youtube')
+        self.youtube_is_live = False
+        self.youtube_title = None
+        self.youtube_uploader = None
+        self.youtube_channel_url = None
+        self.youtube_resolved_url = None
+        self.youtube_resolved_at = None
+
         # Cached FFmpeg commands (used by supervisor for restarts)
         self._pusher_cmd = []
         self._filler_cmd = []
@@ -350,17 +358,52 @@ class StreamProcess:
 
     @staticmethod
     def _extract_stream_url(info):
-        """Best-effort extraction for direct media URL from yt-dlp payload."""
+        """Best-effort extraction for a single playable URL from yt-dlp payload.
+
+        For live streams the HLS master manifest is preferred so FFmpeg can
+        follow live segment rotation natively.  For VOD the best combined
+        (video+audio) format is selected.
+        """
+        is_live = bool(info.get('is_live'))
+
+        if is_live:
+            # For live, the master HLS manifest is the right thing to give FFmpeg
+            manifest = info.get('manifest_url')
+            if manifest:
+                return manifest
+            for fmt in (info.get('formats') or []):
+                url = fmt.get('url') or ''
+                proto = (fmt.get('protocol') or '').lower()
+                if 'm3u8' in proto or '.m3u8' in url.lower():
+                    return url
+
         direct_url = info.get('url')
         if direct_url:
             return direct_url
 
         formats = info.get('formats') or []
+
+        # Prefer formats that include BOTH video and audio
+        combined = [
+            fmt for fmt in formats
+            if fmt.get('url')
+            and fmt.get('vcodec') and fmt.get('vcodec') != 'none'
+            and fmt.get('acodec') and fmt.get('acodec') != 'none'
+        ]
+        if combined:
+            combined.sort(
+                key=lambda f: ((f.get('height') or 0), (f.get('tbr') or 0)),
+                reverse=True
+            )
+            return combined[0]['url']
+
+        # Fallback: any format with video
         for fmt in reversed(formats):
             candidate = fmt.get('url')
             if candidate and fmt.get('vcodec') != 'none':
                 return candidate
 
+        # Playlist-style entries
         entries = info.get('entries') or []
         for entry in entries:
             if not isinstance(entry, dict):
@@ -369,6 +412,107 @@ class StreamProcess:
             if candidate:
                 return candidate
         return None
+
+    @staticmethod
+    def _normalize_youtube_url(url):
+        """Normalize variants like youtube.com/@channel into something yt-dlp
+        always treats as a live-stream lookup."""
+        if not url:
+            return url
+        cleaned = url.strip()
+        # Already explicit /live path: keep as-is
+        if re.search(r'/live(/|$|\?)', cleaned):
+            return cleaned
+        # Bare channel URLs (@handle, /c/name, /channel/UC...): append /live so
+        # yt-dlp resolves the channel's current live broadcast if one exists.
+        channel_patterns = [
+            r'youtube\.com/@[^/?#]+/?$',
+            r'youtube\.com/c/[^/?#]+/?$',
+            r'youtube\.com/user/[^/?#]+/?$',
+            r'youtube\.com/channel/[^/?#]+/?$',
+        ]
+        for pat in channel_patterns:
+            if re.search(pat, cleaned):
+                return cleaned.rstrip('/') + '/live'
+        return cleaned
+
+    def _resolve_youtube_source(self, youtube_url):
+        """Resolve a YouTube URL (video, /live, channel) to a playable URL.
+
+        Returns a dict with keys: success, url, is_live, is_upcoming, title,
+        uploader, channel_url, error.
+        """
+        if not HAS_YTDLP:
+            return {
+                'success': False,
+                'error': 'yt-dlp yuklu degil. Sunucuya yt-dlp kurun.',
+            }
+
+        target = self._normalize_youtube_url(youtube_url)
+
+        ydl_opts = {
+            'format': 'best[protocol*=m3u8][height<=?1080]/best[height<=?1080]/best',
+            'quiet': True,
+            'no_warnings': True,
+            'skip_download': True,
+            'noplaylist': True,
+            # Allow newer YouTube clients yt-dlp knows about
+            'extractor_args': {
+                'youtube': {'player_client': ['default', 'web', 'android', 'ios']},
+            },
+        }
+
+        try:
+            with yt_dlp.YoutubeDL(ydl_opts) as ydl:
+                info = ydl.extract_info(target, download=False)
+        except Exception as e:
+            msg = str(e)
+            lowered = msg.lower()
+            if 'private' in lowered:
+                return {'success': False, 'error': 'Video gizli (private). Erisim yok.'}
+            if 'members-only' in lowered or 'members only' in lowered:
+                return {'success': False, 'error': 'Sadece uyelere ozel video. Erisim yok.'}
+            if 'age' in lowered and 'restrict' in lowered:
+                return {'success': False, 'error': 'Yas kisitli icerik. Cookie gerekli.'}
+            if 'this live event will begin' in lowered or 'is upcoming' in lowered:
+                return {'success': False, 'error': 'Canli yayin henuz baslamadi (planlanan).'}
+            if 'unavailable' in lowered:
+                return {'success': False, 'error': 'Video erisilemiyor (silinmis veya engelli).'}
+            if 'geo' in lowered or 'country' in lowered:
+                return {'success': False, 'error': 'Bolgesel kisitlama (geo-block).'}
+            return {'success': False, 'error': f'YouTube ayristirma hatasi: {msg[:200]}'}
+
+        if not info:
+            return {'success': False, 'error': 'YouTube videosu bulunamadi'}
+
+        # yt-dlp returns a 'playlist'/'multi_video' wrapper for some channel
+        # URLs. Drill down to the first entry if needed.
+        if info.get('_type') in ('playlist', 'multi_video') and info.get('entries'):
+            entries = [e for e in info['entries'] if isinstance(e, dict)]
+            if not entries:
+                return {'success': False, 'error': 'Aktif canli yayin bulunamadi'}
+            info = entries[0]
+
+        if info.get('is_upcoming'):
+            return {'success': False, 'error': 'Canli yayin henuz baslamadi (planlanan).'}
+
+        stream_url = self._extract_stream_url(info)
+        if not stream_url:
+            return {'success': False, 'error': 'Yayinlanabilir stream URL alinamadi'}
+
+        return {
+            'success': True,
+            'url': stream_url,
+            'is_live': bool(info.get('is_live')),
+            'was_live': bool(info.get('was_live')),
+            'is_upcoming': bool(info.get('is_upcoming')),
+            'title': info.get('title') or 'YouTube',
+            'uploader': info.get('uploader') or info.get('channel') or '',
+            'channel_url': info.get('channel_url') or info.get('uploader_url') or '',
+            'thumbnail': info.get('thumbnail') or '',
+            'webpage_url': info.get('webpage_url') or target,
+            'error': None,
+        }
 
     @staticmethod
     def _build_source_headers(source_url):
@@ -639,7 +783,7 @@ class StreamProcess:
         return self._start_resilient_pipeline(source_cmd, rtmp_url)
 
     def start_youtube(self, youtube_url, youtube_key, quality='1080p'):
-        """Start streaming from a YouTube video/live URL to YouTube (resilient mode)."""
+        """Start streaming from a YouTube video/live/channel URL to YouTube."""
         self.source = youtube_url
         self.source_type = 'youtube'
         self.youtube_key = youtube_key
@@ -647,33 +791,29 @@ class StreamProcess:
         self.mode = 'resilient'
         self.auto_restart = True
 
-        if not HAS_YTDLP:
+        self._append_log(f'YouTube kaynagi cozumleniyor: {youtube_url}')
+        resolved = self._resolve_youtube_source(youtube_url)
+        if not resolved.get('success'):
             self.status = 'error'
-            err = 'yt-dlp yuklu degil. Sunucuya yt-dlp kurun.'
+            err = resolved.get('error') or 'YouTube kaynagi cozumlenemedi'
+            self.last_error = err
+            self.last_source_error = err
             self._append_log(err)
             return False, err
 
-        try:
-            self._append_log(f'Fetching stream URL for: {youtube_url}')
-            ydl_opts = {
-                'format': 'best[height<=?1080]/best',
-                'quiet': True,
-                'no_warnings': True,
-            }
-            with yt_dlp.YoutubeDL(ydl_opts) as ydl:
-                info = ydl.extract_info(youtube_url, download=False)
-                stream_url = self._extract_stream_url(info)
-                if not stream_url:
-                    self.status = 'error'
-                    self._append_log('Error: Could not get stream URL from YouTube')
-                    return False, 'Stream URL alinamadi'
-                video_title = info.get('title', 'YouTube Video')
-                self._append_log(f'Got stream URL for: {video_title}')
-        except Exception as e:
-            self.status = 'error'
-            error_msg = f'Error fetching YouTube video: {str(e)}'
-            self._append_log(error_msg)
-            return False, error_msg
+        stream_url = resolved['url']
+        self.youtube_is_live = resolved.get('is_live', False)
+        self.youtube_title = resolved.get('title')
+        self.youtube_uploader = resolved.get('uploader')
+        self.youtube_channel_url = resolved.get('channel_url')
+        self.youtube_resolved_url = stream_url
+        self.youtube_resolved_at = datetime.now()
+
+        tag = 'CANLI' if self.youtube_is_live else 'KAYIT/VOD'
+        self._append_log(
+            f'[{tag}] {self.youtube_title or "?"} '
+            f'(kanal: {self.youtube_uploader or "?"})'
+        )
 
         preset = self._get_preset(quality)
         rtmp_url = f"rtmp://a.rtmp.youtube.com/live2/{youtube_key}"
@@ -1119,30 +1259,43 @@ class StreamProcess:
 
     def _refresh_source_command_if_needed(self):
         """Re-resolve dynamic sources (YouTube URLs) before restart attempts."""
-        if self.source_type == 'youtube' and HAS_YTDLP and self.source:
-            try:
-                ydl_opts = {'format': 'best[height<=?1080]/best',
-                            'quiet': True, 'no_warnings': True}
-                with yt_dlp.YoutubeDL(ydl_opts) as ydl:
-                    info = ydl.extract_info(self.source, download=False)
-                    new_url = self._extract_stream_url(info)
-                    if new_url:
-                        hls_tuning = self._is_hls_url(new_url)
-                        input_url = new_url
-                        if hls_tuning and new_url.startswith(('http://', 'https://')):
-                            input_url = build_hls_proxy_url(new_url, session_key=self.stream_id)
-                        self.source_input_url = input_url
-                        input_options = self._build_network_input_options(
-                            input_url, compatibility=False, hls_tuning=hls_tuning
-                        )
-                        preset = self._get_preset(self.quality)
-                        self._source_cmd = self._build_source_feeder_cmd(
-                            input_url, preset, extra_input_opts=input_options
-                        )
-                        self._append_log('YouTube URL yenilendi', source='supervisor')
-            except Exception as e:
-                self._append_log(f'YouTube URL yenileme hatasi: {e}',
-                                 source='supervisor')
+        if self.source_type != 'youtube' or not self.source:
+            return
+        resolved = self._resolve_youtube_source(self.source)
+        if not resolved.get('success'):
+            err = resolved.get('error') or 'unknown'
+            self.last_source_error = err
+            self._append_log(f'YouTube URL yenileme hatasi: {err}',
+                             source='supervisor')
+            return
+
+        new_url = resolved['url']
+        self.youtube_is_live = resolved.get('is_live', False)
+        self.youtube_title = resolved.get('title') or self.youtube_title
+        self.youtube_uploader = resolved.get('uploader') or self.youtube_uploader
+        self.youtube_channel_url = (
+            resolved.get('channel_url') or self.youtube_channel_url
+        )
+        self.youtube_resolved_url = new_url
+        self.youtube_resolved_at = datetime.now()
+
+        hls_tuning = self._is_hls_url(new_url)
+        input_url = new_url
+        if hls_tuning and new_url.startswith(('http://', 'https://')):
+            input_url = build_hls_proxy_url(new_url, session_key=self.stream_id)
+        self.source_input_url = input_url
+        input_options = self._build_network_input_options(
+            input_url, compatibility=False, hls_tuning=hls_tuning
+        )
+        preset = self._get_preset(self.quality)
+        self._source_cmd = self._build_source_feeder_cmd(
+            input_url, preset, extra_input_opts=input_options
+        )
+        tag = 'CANLI' if self.youtube_is_live else 'VOD'
+        self._append_log(
+            f'YouTube URL yenilendi [{tag}] - {self.youtube_title or "?"}',
+            source='supervisor'
+        )
 
     # ---------- Simple pipeline (single FFmpeg, file/no failover) ----------
     def _start_simple_pipeline(self, cmd):
@@ -1553,6 +1706,11 @@ def stream_status(stream_id):
                 'pusher_restart_attempts': stream_state.get('pusher_restart_attempts', 0),
                 'last_source_error': stream_state.get('last_source_error'),
                 'last_pusher_error': stream_state.get('last_pusher_error'),
+                'source_type': stream_state.get('source_type'),
+                'youtube_is_live': stream_state.get('youtube_is_live', False),
+                'youtube_title': stream_state.get('youtube_title'),
+                'youtube_uploader': stream_state.get('youtube_uploader'),
+                'youtube_channel_url': stream_state.get('youtube_channel_url'),
             })
         return jsonify({'success': False, 'error': 'Stream not found'}), 404
 
@@ -1582,6 +1740,11 @@ def stream_status(stream_id):
         'last_source_error': stream.last_source_error,
         'last_pusher_error': stream.last_pusher_error,
         'bytes_relayed': stream.bytes_relayed,
+        'source_type': stream.source_type,
+        'youtube_is_live': stream.youtube_is_live,
+        'youtube_title': stream.youtube_title,
+        'youtube_uploader': stream.youtube_uploader,
+        'youtube_channel_url': stream.youtube_channel_url,
     })
 
 
@@ -1838,6 +2001,14 @@ def stream_to_state(stream_id, stream):
         'bytes_relayed': getattr(stream, 'bytes_relayed', 0),
         'quality': getattr(stream, 'quality', '1080p'),
         'loop_file': getattr(stream, 'loop_file', False),
+        'youtube_is_live': getattr(stream, 'youtube_is_live', False),
+        'youtube_title': getattr(stream, 'youtube_title', None),
+        'youtube_uploader': getattr(stream, 'youtube_uploader', None),
+        'youtube_channel_url': getattr(stream, 'youtube_channel_url', None),
+        'youtube_resolved_at': (
+            stream.youtube_resolved_at.isoformat()
+            if getattr(stream, 'youtube_resolved_at', None) else None
+        ),
     }
 
 
@@ -2020,7 +2191,7 @@ def iptv_clear_playlist():
 
 @app.route('/api/youtube/info', methods=['POST'])
 def youtube_get_info():
-    """Get info about a YouTube video/live stream."""
+    """Resolve a YouTube URL (video/live/channel) and report its details."""
     if not HAS_YTDLP:
         return jsonify({'success': False, 'error': 'yt-dlp yüklü değil. Sunucuya yt-dlp kurun.'}), 500
 
@@ -2030,34 +2201,32 @@ def youtube_get_info():
     if not url:
         return jsonify({'success': False, 'error': 'YouTube URL gerekli'}), 400
 
-    # Validate YouTube URL
     youtube_pattern = r'(youtube\.com|youtu\.be)'
     if not re.search(youtube_pattern, url):
         return jsonify({'success': False, 'error': 'Geçerli bir YouTube linki girin'}), 400
 
-    try:
-        ydl_opts = {
-            'quiet': True,
-            'no_warnings': True,
-            'skip_download': True,
+    probe = StreamProcess('probe-only')
+    resolved = probe._resolve_youtube_source(url)
+    if not resolved.get('success'):
+        return jsonify({
+            'success': False,
+            'error': resolved.get('error') or 'YouTube videosu cozumlenemedi'
+        }), 400
+
+    return jsonify({
+        'success': True,
+        'info': {
+            'title': resolved.get('title') or 'Bilinmeyen',
+            'uploader': resolved.get('uploader') or 'Bilinmeyen',
+            'is_live': resolved.get('is_live', False),
+            'was_live': resolved.get('was_live', False),
+            'is_upcoming': resolved.get('is_upcoming', False),
+            'thumbnail': resolved.get('thumbnail', ''),
+            'channel_url': resolved.get('channel_url', ''),
+            'webpage_url': resolved.get('webpage_url') or url,
+            'resolved_url': resolved.get('url'),
         }
-
-        with yt_dlp.YoutubeDL(ydl_opts) as ydl:
-            info = ydl.extract_info(url, download=False)
-
-            return jsonify({
-                'success': True,
-                'info': {
-                    'title': info.get('title', 'Bilinmeyen'),
-                    'duration': info.get('duration'),
-                    'uploader': info.get('uploader', 'Bilinmeyen'),
-                    'is_live': info.get('is_live', False),
-                    'thumbnail': info.get('thumbnail', ''),
-                    'view_count': info.get('view_count', 0),
-                }
-            })
-    except Exception as e:
-        return jsonify({'success': False, 'error': f'Video bilgisi alınamadı: {str(e)}'}), 500
+    })
 
 
 @app.route('/api/youtube/stream', methods=['POST'])

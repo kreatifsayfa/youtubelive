@@ -111,14 +111,24 @@
                 <!-- YouTube Tab -->
                 <div class="tab-content" id="youtube-tab">
                     <div class="form-group">
-                        <label for="youtubeUrl">YouTube Video/Canlı Yayın Linki</label>
-                        <input type="text" id="youtubeUrl" placeholder="https://www.youtube.com/watch?v=...">
-                        <small>YouTube videosu veya canlı yayın linkini girin</small>
+                        <label for="youtubeUrl">YouTube Video / Canlı Yayın / Kanal Linki</label>
+                        <input type="text" id="youtubeUrl" placeholder="https://www.youtube.com/@kanal/live veya video linki">
+                        <small>
+                            Desteklenenler: <code>watch?v=...</code>, <code>youtu.be/...</code>,
+                            <code>@kanal</code>, <code>@kanal/live</code>,
+                            <code>/channel/UCxxx/live</code>. Kanal linki yazarsanız o kanalın
+                            aktif canlı yayını otomatik alınır.
+                        </small>
                     </div>
                     <div id="youtubeVideoInfo" style="display: none; margin-top: 15px;">
                         <div class="selected-channel-card">
-                            <h4>Video Bilgisi:</h4>
+                            <div class="youtube-info-header">
+                                <h4>Kaynak:</h4>
+                                <span id="youtubeLiveBadge" class="live-badge" style="display:none;">CANLI</span>
+                                <span id="youtubeVodBadge" class="vod-badge" style="display:none;">VOD</span>
+                            </div>
                             <div id="youtubeVideoTitle" class="selected-channel-name"></div>
+                            <div id="youtubeChannelLabel" class="youtube-channel-label"></div>
                         </div>
                     </div>
                 </div>

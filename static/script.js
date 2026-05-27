@@ -461,7 +461,7 @@ async function pollStatus() {
         if (data.success) {
             statusValue.textContent = getStatusText(data.status);
             statusValue.className = `status-value ${data.status}`;
-            sourceValue.textContent = data.source || '-';
+            sourceValue.innerHTML = formatSourceLabel(data);
             startedAtValue.textContent = data.started_at
                 ? new Date(data.started_at).toLocaleString('tr-TR')
                 : '-';
@@ -550,6 +550,9 @@ m3u8Url.addEventListener('input', updateStartButton);
 const youtubeUrl = document.getElementById('youtubeUrl');
 const youtubeVideoInfoCard = document.getElementById('youtubeVideoInfo');
 const youtubeVideoTitle = document.getElementById('youtubeVideoTitle');
+const youtubeLiveBadge = document.getElementById('youtubeLiveBadge');
+const youtubeVodBadge = document.getElementById('youtubeVodBadge');
+const youtubeChannelLabel = document.getElementById('youtubeChannelLabel');
 
 let youtubeUrlTimeout = null;
 youtubeUrl.addEventListener('input', () => {
@@ -559,13 +562,15 @@ youtubeUrl.addEventListener('input', () => {
     if (!url) {
         youtubeVideoInfoCard.style.display = 'none';
         youtubeVideoData = null;
+        if (youtubeLiveBadge) youtubeLiveBadge.style.display = 'none';
+        if (youtubeVodBadge) youtubeVodBadge.style.display = 'none';
+        if (youtubeChannelLabel) youtubeChannelLabel.textContent = '';
         updateStartButton();
         return;
     }
 
-    // Check if it looks like a YouTube URL
     if (url.includes('youtube.com') || url.includes('youtu.be')) {
-        youtubeUrlTimeout = setTimeout(() => fetchYoutubeInfo(url), 1000);
+        youtubeUrlTimeout = setTimeout(() => fetchYoutubeInfo(url), 800);
     }
 });
 
@@ -582,17 +587,35 @@ async function fetchYoutubeInfo(url) {
         if (data.success) {
             youtubeVideoData = data.info;
             youtubeVideoInfoCard.style.display = 'block';
-            youtubeVideoTitle.textContent = youtubeVideoData.title;
-            showNotification('Video bilgisi yüklendi', 'success');
+            youtubeVideoTitle.textContent = youtubeVideoData.title || '-';
+
+            const isLive = Boolean(youtubeVideoData.is_live);
+            if (youtubeLiveBadge) youtubeLiveBadge.style.display = isLive ? '' : 'none';
+            if (youtubeVodBadge) youtubeVodBadge.style.display = isLive ? 'none' : '';
+            if (youtubeChannelLabel) {
+                const uploader = youtubeVideoData.uploader || '';
+                youtubeChannelLabel.textContent = uploader ? `Kanal: ${uploader}` : '';
+            }
+
+            showNotification(
+                isLive ? 'Canlı yayın algılandı, hazır' : 'Video bilgisi yüklendi',
+                'success'
+            );
             updateStartButton();
         } else {
             showNotification(`Hata: ${data.error}`, 'error');
             youtubeVideoData = null;
+            if (youtubeLiveBadge) youtubeLiveBadge.style.display = 'none';
+            if (youtubeVodBadge) youtubeVodBadge.style.display = 'none';
+            if (youtubeChannelLabel) youtubeChannelLabel.textContent = '';
             updateStartButton();
         }
     } catch (error) {
         showNotification(`Bağlantı hatası: ${error.message}`, 'error');
         youtubeVideoData = null;
+        if (youtubeLiveBadge) youtubeLiveBadge.style.display = 'none';
+        if (youtubeVodBadge) youtubeVodBadge.style.display = 'none';
+        if (youtubeChannelLabel) youtubeChannelLabel.textContent = '';
         updateStartButton();
     }
 }
@@ -661,6 +684,21 @@ function getDualStatusClass(state) {
     if (state === 'starting') return 'warn';
     if (state === 'down' || state === 'stalled' || state === 'error') return 'error';
     return 'warn';
+}
+
+function formatSourceLabel(data) {
+    const source = data.source || '-';
+    if (data.source_type === 'youtube') {
+        const live = data.youtube_is_live
+            ? '<span class="live-badge" style="margin-right:6px;">CANLI</span>'
+            : '<span class="vod-badge" style="margin-right:6px;">VOD</span>';
+        const title = escapeHtml(data.youtube_title || source);
+        const channel = data.youtube_uploader
+            ? ` <span style="color:var(--text-secondary,#94a3b8);">(${escapeHtml(data.youtube_uploader)})</span>`
+            : '';
+        return `${live}${title}${channel}`;
+    }
+    return escapeHtml(source);
 }
 
 function updateDualStatus(data) {
