@@ -646,3 +646,111 @@ header .subtitle {
         gap: 4px;
     }
 }
+
+/* ---- Resilient stream / dual status / standby banner ---- */
+
+.standby-banner {
+    background: linear-gradient(135deg, #b45309, #d97706);
+    color: #fff7ed;
+    padding: 14px 18px;
+    border-radius: 8px;
+    margin-bottom: 16px;
+    display: flex;
+    flex-direction: column;
+    gap: 4px;
+    border-left: 4px solid #fbbf24;
+    box-shadow: 0 4px 12px rgba(217, 119, 6, 0.25);
+    animation: standby-pulse 2.4s ease-in-out infinite;
+}
+
+.standby-banner strong {
+    font-size: 14px;
+    letter-spacing: 0.08em;
+    text-transform: uppercase;
+}
+
+.standby-banner span {
+    font-size: 13px;
+    opacity: 0.92;
+    line-height: 1.4;
+}
+
+@keyframes standby-pulse {
+    0%, 100% { box-shadow: 0 4px 12px rgba(217, 119, 6, 0.25); }
+    50% { box-shadow: 0 4px 24px rgba(251, 191, 36, 0.55); }
+}
+
+.dual-status {
+    display: flex;
+    align-items: stretch;
+    gap: 0;
+    background: rgba(15, 23, 42, 0.4);
+    padding: 12px 16px;
+    border-radius: 8px;
+    margin-bottom: 14px;
+    border: 1px solid rgba(148, 163, 184, 0.15);
+}
+
+.dual-status-item {
+    flex: 1;
+    display: flex;
+    flex-direction: column;
+    align-items: center;
+    justify-content: center;
+    gap: 6px;
+}
+
+.dual-status-label {
+    font-size: 11px;
+    text-transform: uppercase;
+    letter-spacing: 0.1em;
+    color: var(--text-secondary, #94a3b8);
+}
+
+.dual-status-badge {
+    font-size: 14px;
+    font-weight: 600;
+    padding: 4px 14px;
+    border-radius: 999px;
+    min-width: 72px;
+    text-align: center;
+    background: rgba(148, 163, 184, 0.18);
+    color: #cbd5e1;
+}
+
+.dual-status-badge.ok {
+    background: rgba(34, 197, 94, 0.18);
+    color: #4ade80;
+    box-shadow: 0 0 0 1px rgba(34, 197, 94, 0.3) inset;
+}
+
+.dual-status-badge.warn {
+    background: rgba(245, 158, 11, 0.18);
+    color: #fbbf24;
+    box-shadow: 0 0 0 1px rgba(245, 158, 11, 0.3) inset;
+}
+
+.dual-status-badge.error {
+    background: rgba(239, 68, 68, 0.18);
+    color: #f87171;
+    box-shadow: 0 0 0 1px rgba(239, 68, 68, 0.3) inset;
+}
+
+.dual-status-divider {
+    width: 1px;
+    background: rgba(148, 163, 184, 0.2);
+    margin: 0 12px;
+}
+
+@media (max-width: 600px) {
+    .dual-status {
+        flex-direction: column;
+        gap: 10px;
+    }
+
+    .dual-status-divider {
+        width: 100%;
+        height: 1px;
+        margin: 4px 0;
+    }
+}

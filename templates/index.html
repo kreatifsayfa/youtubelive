@@ -137,6 +137,24 @@
             <!-- Active Stream Status -->
             <section class="card" id="streamStatusCard" style="display: none;">
                 <h2>Aktif Yayın</h2>
+
+                <div id="standbyBanner" class="standby-banner" style="display: none;">
+                    <strong>STANDBY YAYINDA</strong>
+                    <span>Kaynak şu anda erişilemiyor - YouTube canlı kalıyor, yedek ekran gösteriliyor. Kaynak geri gelince otomatik geçilecek.</span>
+                </div>
+
+                <div class="dual-status">
+                    <div class="dual-status-item">
+                        <span class="dual-status-label">YouTube</span>
+                        <span class="dual-status-badge" id="pusherStatusBadge">-</span>
+                    </div>
+                    <div class="dual-status-divider"></div>
+                    <div class="dual-status-item">
+                        <span class="dual-status-label">Kaynak</span>
+                        <span class="dual-status-badge" id="sourceStatusBadge">-</span>
+                    </div>
+                </div>
+
                 <div class="stream-status" id="streamStatus">
                     <div class="status-item">
                         <span class="status-label">Durum:</span>
@@ -149,6 +167,18 @@
                     <div class="status-item">
                         <span class="status-label">Başlangıç:</span>
                         <span class="status-value" id="startedAtValue">-</span>
+                    </div>
+                    <div class="status-item">
+                        <span class="status-label">Kaynak yeniden bağlanma:</span>
+                        <span class="status-value" id="sourceRestartsValue">0</span>
+                    </div>
+                    <div class="status-item">
+                        <span class="status-label">Standbyye geçiş:</span>
+                        <span class="status-value" id="failoverCountValue">0</span>
+                    </div>
+                    <div class="status-item" id="lastSourceErrorRow" style="display:none;">
+                        <span class="status-label">Son kaynak hatası:</span>
+                        <span class="status-value" id="lastSourceErrorValue">-</span>
                     </div>
                 </div>
                 <div class="stream-log" id="streamLog"></div>
@@ -181,6 +211,14 @@
                     <div class="health-metric">
                         <span class="health-label">Toplam Restart</span>
                         <span id="healthRestartTotal" class="health-value">0</span>
+                    </div>
+                    <div class="health-metric">
+                        <span class="health-label">Failover</span>
+                        <span id="healthFailoverTotal" class="health-value">0</span>
+                    </div>
+                    <div class="health-metric">
+                        <span class="health-label">Standby Aktif</span>
+                        <span id="healthUsingFiller" class="health-value">0</span>
                     </div>
                 </div>
                 <div class="health-meta">

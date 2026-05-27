@@ -35,9 +35,18 @@ const healthRunningStreams = document.getElementById('healthRunningStreams');
 const healthRestartingStreams = document.getElementById('healthRestartingStreams');
 const healthErrorStreams = document.getElementById('healthErrorStreams');
 const healthRestartTotal = document.getElementById('healthRestartTotal');
+const healthFailoverTotal = document.getElementById('healthFailoverTotal');
+const healthUsingFiller = document.getElementById('healthUsingFiller');
 const healthWorkerPid = document.getElementById('healthWorkerPid');
 const healthLastUpdated = document.getElementById('healthLastUpdated');
 const healthStreamsList = document.getElementById('healthStreamsList');
+const standbyBanner = document.getElementById('standbyBanner');
+const pusherStatusBadge = document.getElementById('pusherStatusBadge');
+const sourceStatusBadge = document.getElementById('sourceStatusBadge');
+const sourceRestartsValue = document.getElementById('sourceRestartsValue');
+const failoverCountValue = document.getElementById('failoverCountValue');
+const lastSourceErrorRow = document.getElementById('lastSourceErrorRow');
+const lastSourceErrorValue = document.getElementById('lastSourceErrorValue');
 
 // Tab Management
 document.querySelectorAll('.tab-btn').forEach(btn => {
@@ -347,6 +356,12 @@ async function pollHealth() {
         healthRestartingStreams.textContent = String(counts.restarting || 0);
         healthErrorStreams.textContent = String(counts.error || 0);
         healthRestartTotal.textContent = String(data.restart_total || 0);
+        if (healthFailoverTotal) {
+            healthFailoverTotal.textContent = String(data.failover_total || 0);
+        }
+        if (healthUsingFiller) {
+            healthUsingFiller.textContent = String(data.using_filler_count || 0);
+        }
         healthWorkerPid.textContent = String(data.worker_pid || '-');
         healthLastUpdated.textContent = new Date().toLocaleString('tr-TR');
 
@@ -451,6 +466,25 @@ async function pollStatus() {
                 ? new Date(data.started_at).toLocaleString('tr-TR')
                 : '-';
 
+            // Failover/resilience details
+            if (sourceRestartsValue) {
+                sourceRestartsValue.textContent = String(
+                    data.source_restart_attempts ?? data.restart_attempts ?? 0
+                );
+            }
+            if (failoverCountValue) {
+                failoverCountValue.textContent = String(data.failover_count || 0);
+            }
+            if (lastSourceErrorRow && lastSourceErrorValue) {
+                if (data.last_source_error) {
+                    lastSourceErrorValue.textContent = data.last_source_error;
+                    lastSourceErrorRow.style.display = '';
+                } else {
+                    lastSourceErrorRow.style.display = 'none';
+                }
+            }
+            updateDualStatus(data);
+
             // Update log
             if (data.log && data.log.length > 0) {
                 streamLog.innerHTML = data.log.map(entry =>
@@ -459,10 +493,13 @@ async function pollStatus() {
                 streamLog.scrollTop = streamLog.scrollHeight;
             }
 
-            // Check if stream stopped unexpectedly
+            // In resilient mode the pusher staying alive is what matters - the
+            // source can be down with standby filling in. Only treat the stream
+            // as broken if the YouTube pusher itself is no longer running.
             const transientStatuses = ['starting', 'restarting'];
-            if (!data.is_running && !transientStatuses.includes(data.status) && data.status !== 'stopped') {
-                showNotification('Yayin beklenmedik sekilde durdu!', 'error');
+            const pusherOk = data.is_running || data.pusher_status === 'live';
+            if (!pusherOk && !transientStatuses.includes(data.status) && data.status !== 'stopped') {
+                showNotification('YouTube baglantisi durdu!', 'error');
                 activeStreamId = null;
                 updateUI(false);
                 stopStatusPolling();
@@ -604,6 +641,46 @@ function getStatusText(status) {
         'error': 'Hata'
     };
     return map[status] || status;
+}
+
+function getDualStatusText(state) {
+    const map = {
+        'live': 'Canli',
+        'starting': 'Baslatiliyor',
+        'down': 'Dustu',
+        'stalled': 'Veri akmiyor',
+        'idle': 'Beklemede',
+        'error': 'Hata',
+        'unknown': '-'
+    };
+    return map[state] || state;
+}
+
+function getDualStatusClass(state) {
+    if (state === 'live') return 'ok';
+    if (state === 'starting') return 'warn';
+    if (state === 'down' || state === 'stalled' || state === 'error') return 'error';
+    return 'warn';
+}
+
+function updateDualStatus(data) {
+    if (pusherStatusBadge) {
+        const pusherState = data.pusher_status || (data.is_running ? 'live' : 'down');
+        pusherStatusBadge.textContent = getDualStatusText(pusherState);
+        pusherStatusBadge.className = `dual-status-badge ${getDualStatusClass(pusherState)}`;
+    }
+    if (sourceStatusBadge) {
+        const sourceState = data.source_status || 'unknown';
+        sourceStatusBadge.textContent = getDualStatusText(sourceState);
+        sourceStatusBadge.className = `dual-status-badge ${getDualStatusClass(sourceState)}`;
+    }
+    if (standbyBanner) {
+        if (data.using_filler) {
+            standbyBanner.style.display = '';
+        } else {
+            standbyBanner.style.display = 'none';
+        }
+    }
 }
 
 function formatSize(bytes) {
