@@ -131,7 +131,10 @@ def ensure_standby_video(quality='1080p', text=None):
     safe_text = re.sub(r"[\\:'\"]+", ' ', raw_text).strip() or 'Yayin yeniden baglaniyor...'
 
     os.makedirs(STANDBY_DIR, exist_ok=True)
-    cache_key = f"{quality}|{safe_text}"
+    # Include rendering-affecting inputs in the cache key so flipping
+    # STANDBY_BG_COLOR or swapping fonts actually invalidates the cached MP4.
+    cache_font = _resolve_drawtext_font() or 'no-font'
+    cache_key = f"{quality}|{safe_text}|{STANDBY_BG_COLOR}|{cache_font}"
 
     with STANDBY_LOCK:
         cached = STANDBY_CACHE.get(cache_key)
@@ -336,7 +339,10 @@ class StreamProcess:
         self._source_cmd = []
 
         # Threading
-        self.process_lock = threading.Lock()
+        # Thread safety in resilient mode relies on the invariant that the
+        # supervisor thread owns the FFmpeg subprocess handles; stop() now
+        # joins the supervisor BEFORE tearing pipes down. No explicit lock
+        # is needed (and the old self.process_lock was dead code).
         self.stop_event = threading.Event()
         self.supervisor_thread = None
         self.simple_monitor_thread = None
@@ -422,12 +428,22 @@ class StreamProcess:
     @staticmethod
     def _normalize_youtube_url(url):
         """Normalize variants like youtube.com/@channel into something yt-dlp
-        always treats as a live-stream lookup."""
+        always treats as a live-stream lookup.
+
+        Matches against the URL path only so things like
+        ``youtube.com/results?search_query=/live`` aren't mistakenly treated
+        as already-live URLs.
+        """
         if not url:
             return url
         cleaned = url.strip()
+        try:
+            parsed = urlparse(cleaned)
+        except Exception:
+            return cleaned
+        path = parsed.path or ''
         # Already explicit /live path: keep as-is
-        if re.search(r'/live(/|$|\?)', cleaned):
+        if re.search(r'(^|/)live/?$', path):
             return cleaned
         # Bare channel URLs (@handle, /c/name, /channel/UC...): append /live so
         # yt-dlp resolves the channel's current live broadcast if one exists.
@@ -442,8 +458,12 @@ class StreamProcess:
                 return cleaned.rstrip('/') + '/live'
         return cleaned
 
-    def _resolve_youtube_source(self, youtube_url):
+    @classmethod
+    def _resolve_youtube_source(cls, youtube_url):
         """Resolve a YouTube URL (video, /live, channel) to a playable URL.
+
+        Pure resolver — does not touch any instance state, so /api/youtube/info
+        can call it without building a fake StreamProcess just to probe URLs.
 
         Returns a dict with keys: success, url, is_live, is_upcoming, title,
         uploader, channel_url, error.
@@ -454,7 +474,7 @@ class StreamProcess:
                 'error': 'yt-dlp yuklu degil. Sunucuya yt-dlp kurun.',
             }
 
-        target = self._normalize_youtube_url(youtube_url)
+        target = cls._normalize_youtube_url(youtube_url)
 
         ydl_opts = {
             'format': 'best[protocol*=m3u8][height<=?1080]/best[height<=?1080]/best',
@@ -466,6 +486,9 @@ class StreamProcess:
             'extractor_args': {
                 'youtube': {'player_client': ['default', 'web', 'android', 'ios']},
             },
+            # Cap network calls so the supervisor thread can't be wedged
+            # by a hung extract_info during a YouTube URL refresh.
+            'socket_timeout': float(os.environ.get('YTDLP_SOCKET_TIMEOUT', '15')),
         }
 
         try:
@@ -502,7 +525,7 @@ class StreamProcess:
         if info.get('is_upcoming'):
             return {'success': False, 'error': 'Canli yayin henuz baslamadi (planlanan).'}
 
-        stream_url = self._extract_stream_url(info)
+        stream_url = cls._extract_stream_url(info)
         if not stream_url:
             return {'success': False, 'error': 'Yayinlanabilir stream URL alinamadi'}
 
@@ -572,15 +595,22 @@ class StreamProcess:
             ])
 
         if not compatibility:
-            options.extend([
+            reconnect_opts = [
                 '-rw_timeout', '15000000',
                 '-reconnect', '1',
                 '-reconnect_streamed', '1',
-                '-reconnect_at_eof', '1',
                 '-reconnect_on_network_error', '1',
                 '-reconnect_on_http_error', '4xx,5xx',
                 '-reconnect_delay_max', '8'
-            ])
+            ]
+            # -reconnect_at_eof is for non-segmented long-running HTTP streams
+            # (a single neverending response). For HLS each segment is a finite
+            # HTTP fetch and EOF marks the end of that segment; turning this
+            # on tight-loops "Will reconnect at N in 0 second(s), error=End of
+            # file" at every segment boundary.
+            if not hls_tuning:
+                reconnect_opts.extend(['-reconnect_at_eof', '1'])
+            options.extend(reconnect_opts)
         else:
             options.extend(['-http_persistent', '0'])
         return options
@@ -951,6 +981,18 @@ class StreamProcess:
             self._append_log(f'Kaynak baslatilamadi: {e}', source='kaynak')
             self.last_source_error = str(e)
 
+        # If neither feeder launched, the pusher has nothing to read; abort
+        # instead of silently sitting in 'running' with no data flowing.
+        if not (self.source_proc or self.filler_proc):
+            self._cleanup_pipeline(quiet=True)
+            self.status = 'error'
+            err = (
+                self.last_source_error
+                or 'Hicbir kaynak baslatilamadi (source ve standby basarisiz)'
+            )
+            self.last_error = err
+            return False, err
+
         self.status = 'running'
         self.supervisor_thread = threading.Thread(
             target=self._supervisor_loop,
@@ -1055,50 +1097,75 @@ class StreamProcess:
         import select as select_mod
 
         next_source_restart_at = None
+        next_pusher_restart_at = None
+        next_filler_restart_at = None
         source_backoff = SOURCE_BACKOFF_INITIAL
         pusher_backoff = PUSHER_BACKOFF_INITIAL
+        filler_backoff = SOURCE_BACKOFF_INITIAL
         last_active_label = None
 
         while not self.stop_event.is_set():
             now = datetime.now()
 
-            # 1) Ensure pusher is alive (skip restart logic during shutdown)
+            # 1) Ensure pusher is alive (deferred restart so the relay loop
+            #    keeps draining feeders during the backoff window instead of
+            #    blocking on stop_event.wait()).
             pusher_alive = self.pusher_proc and self.pusher_proc.poll() is None
             if not pusher_alive:
                 if self.stop_event.is_set():
                     break
-                code = self.pusher_proc.poll() if self.pusher_proc else None
-                self._append_log(
-                    f'Pusher dustu (kod: {code}), yeniden baslatiliyor',
-                    source='pusher'
-                )
-                self.pusher_status = 'down'
-                self.pusher_restart_attempts += 1
-                self.last_pusher_error = f'exit code {code}'
-                self._terminate_process(self.pusher_proc, force=True)
-                self.pusher_proc = None
-                self.pid = None
-                if self.stop_event.wait(pusher_backoff):
-                    break
-                pusher_backoff = min(pusher_backoff * 2, PUSHER_BACKOFF_MAX)
-                try:
-                    self._launch_pusher()
-                    pusher_backoff = PUSHER_BACKOFF_INITIAL
-                except Exception as e:
-                    self.last_pusher_error = str(e)
-                    self._append_log(f'Pusher baslatilamadi: {e}', source='pusher')
-                continue
+                if self.pusher_proc is not None:
+                    code = self.pusher_proc.poll()
+                    self._append_log(
+                        f'Pusher dustu (kod: {code}), yeniden baglanacak',
+                        source='pusher'
+                    )
+                    self.pusher_status = 'down'
+                    self.pusher_restart_attempts += 1
+                    self.last_pusher_error = f'exit code {code}'
+                    self._terminate_process(self.pusher_proc, force=True)
+                    self.pusher_proc = None
+                    self.pid = None
+                if next_pusher_restart_at is None:
+                    next_pusher_restart_at = now + timedelta(seconds=pusher_backoff)
+                elif now >= next_pusher_restart_at:
+                    try:
+                        self._launch_pusher()
+                        pusher_backoff = PUSHER_BACKOFF_INITIAL
+                        next_pusher_restart_at = None
+                    except Exception as e:
+                        self.last_pusher_error = str(e)
+                        self._append_log(f'Pusher baslatilamadi: {e}', source='pusher')
+                        pusher_backoff = min(pusher_backoff * 2, PUSHER_BACKOFF_MAX)
+                        next_pusher_restart_at = now + timedelta(seconds=pusher_backoff)
+                # Fall through to keep reading feeders even while pusher is down;
+                # bytes will be discarded by the should_write check below.
 
-            # 2) Ensure filler is alive (skip restart during shutdown)
+            # 2) Ensure filler is alive (deferred restart with backoff so a
+            #    persistent filler failure doesn't hot-loop).
             filler_alive = self.filler_proc and self.filler_proc.poll() is None
             if not filler_alive and not self.stop_event.is_set():
-                self._append_log('Standby yeniden baslatiliyor', source='standby')
-                try:
+                if self.filler_proc is not None:
                     self._terminate_process(self.filler_proc, force=True)
                     self.filler_proc = None
-                    self._launch_filler()
-                except Exception as e:
-                    self._append_log(f'Standby baslatilamadi: {e}', source='standby')
+                if next_filler_restart_at is None:
+                    next_filler_restart_at = now + timedelta(seconds=filler_backoff)
+                    self._append_log(
+                        f'Standby {filler_backoff:.1f}s sonra yeniden baslatilacak',
+                        source='standby'
+                    )
+                elif now >= next_filler_restart_at:
+                    try:
+                        self._launch_filler()
+                        filler_backoff = SOURCE_BACKOFF_INITIAL
+                        next_filler_restart_at = None
+                    except Exception as e:
+                        self._append_log(f'Standby baslatilamadi: {e}', source='standby')
+                        filler_backoff = min(filler_backoff * 2, SOURCE_BACKOFF_MAX)
+                        next_filler_restart_at = now + timedelta(seconds=filler_backoff)
+            elif filler_alive:
+                next_filler_restart_at = None
+                filler_backoff = SOURCE_BACKOFF_INITIAL
 
             # 3) Determine source health & kill stalled source
             source_alive = self.source_proc and self.source_proc.poll() is None
@@ -1276,8 +1343,54 @@ class StreamProcess:
         self._append_log('Supervisor sonlandi', source='supervisor')
 
     def _refresh_source_command_if_needed(self):
-        """Re-resolve dynamic sources (YouTube URLs) before restart attempts."""
-        if self.source_type != 'youtube' or not self.source:
+        """Re-resolve dynamic sources before restart attempts.
+
+        For YouTube: re-runs yt-dlp so an expired CDN signature gets refreshed.
+        For M3U8/IPTV: re-runs the preflight so a rotated signed token or
+        new cookie picked up from the master playlist replaces the stale one.
+        Either form keeps long-running streams alive once the upstream URL
+        expires without operator intervention.
+        """
+        if not self.source:
+            return
+        if self.source_type == 'm3u8':
+            try:
+                is_valid, validation_error, preflight = self._validate_m3u8_source(self.source)
+            except Exception as e:
+                self._append_log(f'M3U8 yenileme hatasi: {e}', source='supervisor')
+                return
+            if not is_valid:
+                self.last_source_error = validation_error
+                self._append_log(
+                    f'M3U8 yenileme hatasi: {validation_error}',
+                    source='supervisor'
+                )
+                return
+            resolved_url = preflight.get('resolved_input_url') if preflight else self.source
+            self.source_cookies = preflight.get('cookie_header') if preflight else self.source_cookies
+            hls_tuning = self._is_hls_url(resolved_url)
+            use_proxy = (
+                hls_tuning
+                and not HLS_PROXY_DISABLED
+                and resolved_url.startswith(('http://', 'https://'))
+            )
+            input_url = (
+                build_hls_proxy_url(
+                    resolved_url, self.source_cookies, session_key=self.stream_id
+                ) if use_proxy else resolved_url
+            )
+            self.source_input_url = input_url
+            input_options = self._build_network_input_options(
+                input_url, compatibility=False,
+                cookie_header=self.source_cookies, hls_tuning=hls_tuning
+            )
+            preset = self._get_preset(self.quality)
+            self._source_cmd = self._build_source_feeder_cmd(
+                input_url, preset, extra_input_opts=input_options
+            )
+            self._append_log('M3U8 kaynagi yeniden dogrulandi', source='supervisor')
+            return
+        if self.source_type != 'youtube':
             return
         resolved = self._resolve_youtube_source(self.source)
         if not resolved.get('success'):
@@ -1404,13 +1517,25 @@ class StreamProcess:
         if self.mode == 'simple':
             self._stop_simple()
         else:
-            self._cleanup_pipeline()
+            # Join supervisor BEFORE tearing down pipes. Otherwise the
+            # supervisor mid-iteration could see pusher/filler as None and
+            # relaunch them after stop() returns, leaking Popen processes
+            # and stderr-consumer threads.
             sup = self.supervisor_thread
             if sup and sup.is_alive():
+                # Close pusher stdin to unblock supervisor if it's mid-write,
+                # then wait for it to observe stop_event and exit.
+                pusher = self.pusher_proc
+                if pusher and pusher.stdin and not pusher.stdin.closed:
+                    try:
+                        pusher.stdin.close()
+                    except Exception:
+                        pass
                 try:
-                    sup.join(timeout=4)
+                    sup.join(timeout=6)
                 except Exception:
                     pass
+            self._cleanup_pipeline()
         self.status = 'stopped'
         self._append_log('Stream kullanici tarafindan durduruldu')
 
@@ -1488,9 +1613,44 @@ class StreamProcess:
     def is_running(self):
         if self.mode == 'simple':
             return bool(self.simple_proc and self.simple_proc.poll() is None)
-        return bool(self.pusher_proc and self.pusher_proc.poll() is None)
+        # In resilient mode "running" means the supervisor is alive and
+        # managing the pipeline. The pusher subprocess itself may briefly
+        # not exist mid-restart; that's not a failure as long as the
+        # supervisor will bring it back.
+        if self.pusher_proc and self.pusher_proc.poll() is None:
+            return True
+        if self.supervisor_thread and self.supervisor_thread.is_alive() and not self.manually_stopped:
+            return True
+        return False
 
     def refresh_runtime_status(self):
+        if self.mode == 'resilient':
+            pusher_live = bool(self.pusher_proc and self.pusher_proc.poll() is None)
+            sup_live = bool(
+                self.supervisor_thread
+                and self.supervisor_thread.is_alive()
+                and not self.manually_stopped
+            )
+            if pusher_live:
+                if self.status not in ('running', 'starting'):
+                    self.status = 'running'
+                return
+            if sup_live:
+                # Pusher is between exits and the supervisor's next launch
+                # attempt; surface this as a transient state instead of
+                # flipping to 'error' (which makes the frontend tear down
+                # its polling UI even though we'll recover within seconds).
+                self.status = 'restarting'
+                return
+            if self.status in ('running', 'starting', 'restarting'):
+                self.status = 'error'
+                if self.last_pusher_error:
+                    self._append_log(f'Pusher calismiyor: {self.last_pusher_error}')
+                else:
+                    self._append_log('Pusher calismiyor')
+            return
+
+        # simple mode: original semantics
         running = self.is_running()
         if running and self.status not in ('running', 'starting', 'restarting'):
             self.status = 'running'
@@ -1569,9 +1729,15 @@ def hls_proxy():
 
     content_type = upstream_response.headers.get('Content-Type', '')
     body = upstream_response.content or b''
+    # urlparse so '?token=...' on the source URL doesn't defeat the m3u8 sniff.
+    try:
+        source_path = urlparse(source_url).path.lower()
+    except Exception:
+        source_path = source_url.lower()
     is_playlist = (
         'mpegurl' in content_type.lower()
-        or source_url.lower().endswith('.m3u8')
+        or source_path.endswith('.m3u8')
+        or source_path.endswith('.m3u')
         or b'#EXTM3U' in body
     )
 
@@ -1591,26 +1757,59 @@ def hls_proxy():
     base_url = upstream_response.url or source_url
     out_lines = []
     media_url_count = 0
+    session_for_children = session_key or jar_key
+
+    def _rewrite_uri_attrs(directive_line):
+        """Proxy URI="..." attributes inside HLS tag directives.
+
+        Without this, #EXT-X-MEDIA (alternate audio), #EXT-X-MAP (init segments)
+        and #EXT-X-KEY (decryption keys) URIs would bypass the proxy and hit
+        origin directly without any cookies/referer the proxy is forwarding,
+        breaking IPTV streams that ship separate audio renditions, fMP4 init,
+        or AES-128 encryption.
+        """
+        def _replace(match):
+            inner = match.group(1)
+            absolute = urljoin(base_url, inner)
+            return f'URI="{build_hls_proxy_url(absolute, session_key=session_for_children)}"'
+        return re.sub(r'URI="([^"]+)"', _replace, directive_line)
+
+    URI_TAG_RE = re.compile(
+        r'^#EXT-X-(MEDIA|MAP|KEY|SESSION-DATA|SESSION-KEY|I-FRAME-STREAM-INF|PART-INF|PRELOAD-HINT|RENDITION-REPORT)\b'
+    )
 
     for line in text.splitlines():
         stripped = line.strip()
-        if not stripped or stripped.startswith('#'):
+        if not stripped:
             out_lines.append(line)
+            continue
+        if stripped.startswith('#'):
+            if URI_TAG_RE.match(stripped) and 'URI="' in stripped:
+                out_lines.append(_rewrite_uri_attrs(line))
+            else:
+                out_lines.append(line)
             continue
 
         absolute_url = urljoin(base_url, stripped)
         proxied_url = build_hls_proxy_url(
             absolute_url,
-            session_key=session_key or jar_key
+            session_key=session_for_children
         )
         out_lines.append(proxied_url)
         media_url_count += 1
 
     if media_url_count == 0:
-        return jsonify({
-            'success': False,
-            'error': 'Upstream HLS playlist has no media URLs'
-        }), 502
+        # Empty playlist (no segment lines and no variants) is a valid HLS
+        # state for live streams that haven't started yet -- return a valid
+        # but empty playlist so FFmpeg retries cleanly instead of treating
+        # a 502 JSON body as a malformed segment.
+        rewritten = '\n'.join(out_lines) if out_lines else '#EXTM3U'
+        return Response(
+            rewritten,
+            status=200,
+            content_type='application/vnd.apple.mpegurl; charset=utf-8',
+            headers={'Cache-Control': 'no-cache, no-store, must-revalidate'}
+        )
 
     rewritten = '\n'.join(out_lines)
     return Response(
@@ -2230,8 +2429,7 @@ def youtube_get_info():
     if not re.search(youtube_pattern, url):
         return jsonify({'success': False, 'error': 'Geçerli bir YouTube linki girin'}), 400
 
-    probe = StreamProcess('probe-only')
-    resolved = probe._resolve_youtube_source(url)
+    resolved = StreamProcess._resolve_youtube_source(url)
     if not resolved.get('success'):
         return jsonify({
             'success': False,
