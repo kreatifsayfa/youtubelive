@@ -41,16 +41,16 @@ os.makedirs(app.config['UPLOAD_FOLDER'], exist_ok=True)
 active_streams = {}
 
 BITRATE_MAP = {
-    '720p': '3500k',
-    '1080p': '6000k',
-    '1440p': '12000k',
+    '720p': '4000k',
+    '1080p': '6800k',
+    '1440p': '13000k',
     '2160p': '24000k'
 }
 
 QUALITY_PRESETS = {
-    '720p':  {'width': 1280, 'height': 720,  'bitrate': '3500k',  'fps': 30},
-    '1080p': {'width': 1920, 'height': 1080, 'bitrate': '6000k',  'fps': 30},
-    '1440p': {'width': 2560, 'height': 1440, 'bitrate': '12000k', 'fps': 30},
+    '720p':  {'width': 1280, 'height': 720,  'bitrate': '4000k',  'fps': 30},
+    '1080p': {'width': 1920, 'height': 1080, 'bitrate': '6800k',  'fps': 30},
+    '1440p': {'width': 2560, 'height': 1440, 'bitrate': '13000k', 'fps': 30},
     '2160p': {'width': 3840, 'height': 2160, 'bitrate': '24000k', 'fps': 30},
 }
 
@@ -72,7 +72,11 @@ STANDBY_DIR = os.path.join(tempfile.gettempdir(), 'youtubelive_standby')
 STANDBY_LOCK = threading.Lock()
 STANDBY_CACHE = {}
 
-SOURCE_DATA_TIMEOUT_SECONDS = float(os.environ.get('SOURCE_DATA_TIMEOUT', '2.5'))
+# How long the source may go without delivering a byte before we fail over to
+# standby. With -re the source emits a continuous 1x trickle, so a few seconds
+# of margin (covers B-frame/lookahead buffering and brief HLS reload pauses)
+# avoids false failovers without making a real outage linger.
+SOURCE_DATA_TIMEOUT_SECONDS = float(os.environ.get('SOURCE_DATA_TIMEOUT', '4.0'))
 SOURCE_STALL_TIMEOUT_SECONDS = float(os.environ.get('SOURCE_STALL_TIMEOUT', '12.0'))
 # Initial warm-up grace BEFORE the source emits its first byte. A live YouTube
 # HLS feeder must fetch the manifest, download the first segments and prime the
@@ -620,18 +624,20 @@ class StreamProcess:
         source_url,
         compatibility=False,
         cookie_header=None,
-        hls_tuning=False,
-        live=False
+        hls_tuning=False
     ):
         """Build FFmpeg input options for network streams."""
-        options = []
-        # -re throttles the input to realtime. A LIVE source (HLS segments or a
-        # continuous TS feed) is already paced at 1x by the upstream, so adding
-        # -re only makes FFmpeg lag behind the live edge until segments expire,
-        # which manifests as the source never producing data and the stream
-        # being stuck on the standby feed. Use -re only for non-live (VOD).
-        if not live:
-            options.append('-re')
+        # -re paces the input at 1x realtime, which is essential for BOTH live
+        # and VOD restreaming. Live HLS delivers data in per-segment bursts: a
+        # feeder WITHOUT -re races through each downloaded segment, emits a
+        # burst, then sits idle for several seconds waiting for the next segment
+        # to appear at the live edge. Those idle gaps look exactly like a dead
+        # source to the failover supervisor, so it flaps source<->standby every
+        # few seconds and the spliced H.264 gets corrupted ("Packet corrupt",
+        # "Out of range weight", reference-count overflow). -re turns the output
+        # into a steady 1x trickle so the source stays continuously fresh and
+        # failover only fires on a genuine outage.
+        options = ['-re']
         options.extend([
             '-thread_queue_size', '2048',
             '-user_agent', DEFAULT_INPUT_USER_AGENT,
@@ -876,8 +882,7 @@ class StreamProcess:
             self.source_input_url,
             compatibility=False,
             cookie_header=self.source_cookies,
-            hls_tuning=True,
-            live=True
+            hls_tuning=True
         )
 
         source_cmd = self._build_source_feeder_cmd(
@@ -939,8 +944,7 @@ class StreamProcess:
         self.source_input_url = input_url
 
         input_options = self._build_network_input_options(
-            input_url, compatibility=False, hls_tuning=hls_tuning,
-            live=self.youtube_is_live
+            input_url, compatibility=False, hls_tuning=hls_tuning
         )
         source_cmd = self._build_source_feeder_cmd(
             input_url, preset, extra_input_opts=input_options
@@ -1456,8 +1460,7 @@ class StreamProcess:
             self.source_input_url = input_url
             input_options = self._build_network_input_options(
                 input_url, compatibility=False,
-                cookie_header=self.source_cookies, hls_tuning=hls_tuning,
-                live=True
+                cookie_header=self.source_cookies, hls_tuning=hls_tuning
             )
             preset = self._get_preset(self.quality)
             self._source_cmd = self._build_source_feeder_cmd(
@@ -1520,8 +1523,7 @@ class StreamProcess:
         )
         self.source_input_url = input_url
         input_options = self._build_network_input_options(
-            input_url, compatibility=False, hls_tuning=hls_tuning,
-            live=self.youtube_is_live
+            input_url, compatibility=False, hls_tuning=hls_tuning
         )
         preset = self._get_preset(self.quality)
         self._source_cmd = self._build_source_feeder_cmd(
