@@ -41,18 +41,24 @@ os.makedirs(app.config['UPLOAD_FOLDER'], exist_ok=True)
 active_streams = {}
 
 BITRATE_MAP = {
-    '720p': '2500k',
-    '1080p': '4500k',
-    '1440p': '9000k',
-    '2160p': '18000k'
+    '720p': '3500k',
+    '1080p': '6000k',
+    '1440p': '12000k',
+    '2160p': '24000k'
 }
 
 QUALITY_PRESETS = {
-    '720p':  {'width': 1280, 'height': 720,  'bitrate': '2500k',  'fps': 30},
-    '1080p': {'width': 1920, 'height': 1080, 'bitrate': '4500k',  'fps': 30},
-    '1440p': {'width': 2560, 'height': 1440, 'bitrate': '9000k',  'fps': 30},
-    '2160p': {'width': 3840, 'height': 2160, 'bitrate': '18000k', 'fps': 30},
+    '720p':  {'width': 1280, 'height': 720,  'bitrate': '3500k',  'fps': 30},
+    '1080p': {'width': 1920, 'height': 1080, 'bitrate': '6000k',  'fps': 30},
+    '1440p': {'width': 2560, 'height': 1440, 'bitrate': '12000k', 'fps': 30},
+    '2160p': {'width': 3840, 'height': 2160, 'bitrate': '24000k', 'fps': 30},
 }
+
+# x264 preset for the re-encode. Slower = better quality at the same bitrate but
+# more CPU. Default stays CPU-safe ('veryfast'); bump to 'faster'/'fast' if the
+# host has spare cores. The big quality wins (B-frames, lookahead, 2s GOP) come
+# from dropping -tune zerolatency below, which costs little CPU.
+H264_PRESET = os.environ.get('H264_PRESET', 'veryfast')
 
 DEFAULT_INPUT_USER_AGENT = os.environ.get(
     'STREAM_INPUT_USER_AGENT',
@@ -783,19 +789,25 @@ class StreamProcess:
             '-map', '0:v:0?', '-map', '0:a:0?',
             '-vf', (
                 f"scale={preset['width']}:{preset['height']}:"
-                f"force_original_aspect_ratio=decrease:flags=fast_bilinear,"
+                f"force_original_aspect_ratio=decrease:flags=lanczos,"
                 f"pad={preset['width']}:{preset['height']}:-1:-1:color=black,"
                 f"fps={preset['fps']},format=yuv420p,setpts=PTS-STARTPTS"
             ),
             '-af', 'aresample=async=1:first_pts=0,asetpts=PTS-STARTPTS',
-            '-c:v', 'libx264', '-preset', 'veryfast', '-tune', 'zerolatency',
-            '-profile:v', 'main', '-level', '4.0',
+            # No -tune zerolatency: this is a restream, not an interactive feed,
+            # so we keep B-frames, mb-tree and rc-lookahead which dramatically
+            # improve quality at the same bitrate (zerolatency disabled all of
+            # them, which is why detail/motion-heavy scenes looked mushy).
+            '-c:v', 'libx264', '-preset', H264_PRESET,
+            '-profile:v', 'high', '-level', '4.2',
             '-b:v', bitrate, '-maxrate', bitrate,
             '-bufsize', f"{int(bitrate[:-1]) * 2}k",
             '-pix_fmt', 'yuv420p',
-            '-g', str(preset['fps']), '-keyint_min', str(preset['fps']),
-            '-sc_threshold', '0',
-            '-c:a', 'aac', '-b:a', '128k', '-ar', '44100', '-ac', '2',
+            # 2-second GOP (YouTube's recommendation) instead of 1s wastes far
+            # fewer bits on keyframes, leaving more for actual picture detail.
+            '-g', str(preset['fps'] * 2), '-keyint_min', str(preset['fps']),
+            '-bf', '3', '-sc_threshold', '0',
+            '-c:a', 'aac', '-b:a', '160k', '-ar', '44100', '-ac', '2',
             '-max_muxing_queue_size', '1024',
             '-f', 'mpegts',
             '-mpegts_flags', 'resend_headers+initial_discontinuity',
