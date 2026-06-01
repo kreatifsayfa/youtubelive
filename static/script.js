@@ -17,6 +17,17 @@ let iptvGroups = [];
 // DOM Elements
 const youtubeKey = document.getElementById('youtubeKey');
 const quality = document.getElementById('quality');
+const tiktokServer = document.getElementById('tiktokServer');
+const tiktokKey = document.getElementById('tiktokKey');
+
+// Optional simultaneous TikTok destination — sent with every start request.
+// Backend ignores it unless BOTH server URL and key are present.
+function getTiktokFields() {
+    return {
+        tiktok_url: ((tiktokServer && tiktokServer.value) || '').trim(),
+        tiktok_key: ((tiktokKey && tiktokKey.value) || '').trim()
+    };
+}
 const m3u8Url = document.getElementById('m3u8Url');
 const fileInput = document.getElementById('fileInput');
 const uploadArea = document.getElementById('uploadArea');
@@ -43,6 +54,9 @@ const healthStreamsList = document.getElementById('healthStreamsList');
 const standbyBanner = document.getElementById('standbyBanner');
 const pusherStatusBadge = document.getElementById('pusherStatusBadge');
 const sourceStatusBadge = document.getElementById('sourceStatusBadge');
+const tiktokStatusItem = document.getElementById('tiktokStatusItem');
+const tiktokStatusDivider = document.getElementById('tiktokStatusDivider');
+const tiktokStatusBadge = document.getElementById('tiktokStatusBadge');
 const sourceRestartsValue = document.getElementById('sourceRestartsValue');
 const failoverCountValue = document.getElementById('failoverCountValue');
 const lastSourceErrorRow = document.getElementById('lastSourceErrorRow');
@@ -183,7 +197,8 @@ async function startStream() {
     let payload = {
         youtube_key: key,
         quality: quality.value,
-        type: currentTab
+        type: currentTab,
+        ...getTiktokFields()
     };
 
     if (currentTab === 'm3u8') {
@@ -256,7 +271,8 @@ async function startIptvStream(key, qualityValue) {
                 channel_url: selectedChannel.url,
                 channel_name: selectedChannel.name,
                 youtube_key: key,
-                quality: qualityValue
+                quality: qualityValue,
+                ...getTiktokFields()
             })
         });
 
@@ -631,7 +647,8 @@ async function startYoutubeStream(key, qualityValue) {
             body: JSON.stringify({
                 youtube_url: youtubeUrl.value.trim(),
                 youtube_key: key,
-                quality: qualityValue
+                quality: qualityValue,
+                ...getTiktokFields()
             })
         });
 
@@ -711,6 +728,18 @@ function updateDualStatus(data) {
         const sourceState = data.source_status || 'unknown';
         sourceStatusBadge.textContent = getDualStatusText(sourceState);
         sourceStatusBadge.className = `dual-status-badge ${getDualStatusClass(sourceState)}`;
+    }
+    if (tiktokStatusItem && tiktokStatusBadge) {
+        if (data.secondary_enabled) {
+            const ttState = data.pusher2_status || 'down';
+            tiktokStatusBadge.textContent = getDualStatusText(ttState);
+            tiktokStatusBadge.className = `dual-status-badge ${getDualStatusClass(ttState)}`;
+            tiktokStatusItem.style.display = '';
+            if (tiktokStatusDivider) tiktokStatusDivider.style.display = '';
+        } else {
+            tiktokStatusItem.style.display = 'none';
+            if (tiktokStatusDivider) tiktokStatusDivider.style.display = 'none';
+        }
     }
     if (standbyBanner) {
         if (data.using_filler) {

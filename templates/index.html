@@ -27,11 +27,22 @@
                 <div class="form-group">
                     <label for="quality">Video Kalitesi</label>
                     <select id="quality">
-                        <option value="720p">720p (HD) - 2.5 Mbps</option>
-                        <option value="1080p" selected>1080p (Full HD) - 4.5 Mbps</option>
-                        <option value="1440p">1440p (2K) - 9 Mbps</option>
-                        <option value="2160p">2160p (4K) - 18 Mbps</option>
+                        <option value="720p">720p (HD) - 4 Mbps</option>
+                        <option value="1080p" selected>1080p (Full HD) - 6.8 Mbps</option>
+                        <option value="1440p">1440p (2K) - 13 Mbps</option>
+                        <option value="2160p">2160p (4K) - 24 Mbps</option>
                     </select>
+                </div>
+                <div class="form-group">
+                    <label for="tiktokServer">TikTok'a da yayınla (opsiyonel)</label>
+                    <input type="text" id="tiktokServer" placeholder="Server URL (örn. rtmp://push.live.tiktok.com/live)">
+                    <input type="password" id="tiktokKey" placeholder="TikTok Stream Key" style="margin-top:8px;">
+                    <small>
+                        Doldurursan YouTube ile <strong>aynı anda</strong> TikTok'a da gider (yatay 16:9).
+                        TikTok LIVE Studio veya livecenter.tiktok.com → <em>Go LIVE</em> adımında çıkan
+                        Server URL + Stream Key'i buraya yapıştır. Boş bırakırsan yalnızca YouTube'a yayınlanır.
+                        <br>Not: TikTok anahtarı ~2 saatte bir yenilenir; uzun yayında süresi dolarsa yeni anahtarla tekrar başlat.
+                    </small>
                 </div>
             </section>
 
@@ -162,6 +173,11 @@
                     <div class="dual-status-item">
                         <span class="dual-status-label">Kaynak</span>
                         <span class="dual-status-badge" id="sourceStatusBadge">-</span>
+                    </div>
+                    <div class="dual-status-divider" id="tiktokStatusDivider" style="display:none;"></div>
+                    <div class="dual-status-item" id="tiktokStatusItem" style="display:none;">
+                        <span class="dual-status-label">TikTok</span>
+                        <span class="dual-status-badge" id="tiktokStatusBadge">-</span>
                     </div>
                 </div>
 

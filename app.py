@@ -12,6 +12,7 @@ import uuid
 import re
 import shutil
 import threading
+import queue
 import time
 import json
 import tempfile
@@ -97,6 +98,12 @@ PUSHER_BACKOFF_INITIAL = float(os.environ.get('PUSHER_BACKOFF_INITIAL', '1.0'))
 PUSHER_BACKOFF_MAX = float(os.environ.get('PUSHER_BACKOFF_MAX', '15.0'))
 RELAY_CHUNK_SIZE = int(os.environ.get('RELAY_CHUNK_SIZE', '65536'))
 SUPERVISOR_SELECT_TIMEOUT = float(os.environ.get('SUPERVISOR_SELECT_TIMEOUT', '0.4'))
+# Bounded buffer (in relay chunks) for an optional secondary RTMP push (e.g.
+# simultaneous TikTok). A dedicated writer thread drains it, so if the secondary
+# destination stalls the queue fills and we DROP chunks for it rather than
+# blocking the relay — the primary (YouTube) push is never slowed by a slow
+# secondary. ~64 * 64KB ≈ 4 MB ≈ a few seconds of headroom.
+PUSHER2_QUEUE_MAX = int(os.environ.get('PUSHER2_QUEUE_MAX', '64'))
 
 # HLS proxy: required for some IPTV providers (cookie/referer needs) but breaks
 # YouTube's 3-tier HLS structure (master -> per-quality -> segments). Default
@@ -270,6 +277,23 @@ def build_hls_proxy_url(source_url, cookie_header=None, session_key=None):
     return f'{base}?{query}'
 
 
+def build_secondary_rtmp_url(server_url, stream_key):
+    """Join a user-supplied RTMP server URL + stream key into one push URL.
+
+    Used for an optional simultaneous secondary destination (e.g. TikTok which,
+    unlike YouTube, hands out BOTH a server URL and a separate key that both
+    rotate per session). Returns None if either part is missing or the server
+    isn't an rtmp(s) URL.
+    """
+    server_url = (server_url or '').strip()
+    stream_key = (stream_key or '').strip()
+    if not server_url or not stream_key:
+        return None
+    if not server_url.startswith(('rtmp://', 'rtmps://')):
+        return None
+    return server_url.rstrip('/') + '/' + stream_key.lstrip('/')
+
+
 class StreamProcess:
     """Resilient YouTube streamer.
 
@@ -363,6 +387,23 @@ class StreamProcess:
         # Restart-attempt count at the last YouTube re-resolve; used to gate how
         # often the supervisor pays for a blocking yt-dlp refresh.
         self._last_resolve_restart_count = 0
+
+        # Optional secondary RTMP destination (e.g. simultaneous TikTok push).
+        # When unset every secondary code path is guarded off, so a YouTube-only
+        # stream behaves byte-for-byte like before. The secondary is best-effort
+        # and fully isolated: it has its own pusher process, its own restart
+        # backoff, and a drop-on-full writer queue so it can never stall or
+        # break the primary push.
+        self.secondary_enabled = False
+        self.secondary_name = None          # log/status label, e.g. 'tiktok'
+        self.secondary_rtmp_url = None
+        self.pusher2_proc = None
+        self.pusher2_status = 'idle'
+        self.pusher2_restart_attempts = 0
+        self.pusher2_dropped_chunks = 0
+        self.last_pusher2_error = None
+        self._pusher2_cmd = []
+        self._pusher2_queue = None
 
         # Threading
         # Thread safety in resilient mode relies on the invariant that the
@@ -853,7 +894,8 @@ class StreamProcess:
         ]
 
     # ---------- Public start_* methods ----------
-    def start_m3u8(self, m3u8_url, youtube_key, quality='1080p'):
+    def start_m3u8(self, m3u8_url, youtube_key, quality='1080p',
+                   secondary_rtmp_url=None, secondary_name=None):
         """Start streaming from M3U8 URL to YouTube (resilient mode)."""
         self.source = m3u8_url
         self.source_type = 'm3u8'
@@ -888,9 +930,12 @@ class StreamProcess:
         source_cmd = self._build_source_feeder_cmd(
             self.source_input_url, preset, extra_input_opts=input_options
         )
-        return self._start_resilient_pipeline(source_cmd, rtmp_url)
+        return self._start_resilient_pipeline(
+            source_cmd, rtmp_url, secondary_rtmp_url, secondary_name
+        )
 
-    def start_youtube(self, youtube_url, youtube_key, quality='1080p'):
+    def start_youtube(self, youtube_url, youtube_key, quality='1080p',
+                      secondary_rtmp_url=None, secondary_name=None):
         """Start streaming from a YouTube video/live/channel URL to YouTube."""
         self.source = youtube_url
         self.source_type = 'youtube'
@@ -949,9 +994,12 @@ class StreamProcess:
         source_cmd = self._build_source_feeder_cmd(
             input_url, preset, extra_input_opts=input_options
         )
-        return self._start_resilient_pipeline(source_cmd, rtmp_url)
+        return self._start_resilient_pipeline(
+            source_cmd, rtmp_url, secondary_rtmp_url, secondary_name
+        )
 
-    def start_file(self, file_path, youtube_key, quality='1080p', loop=False):
+    def start_file(self, file_path, youtube_key, quality='1080p', loop=False,
+                   secondary_rtmp_url=None, secondary_name=None):
         """Start streaming from a local file to YouTube.
 
         loop=True uses the resilient pipeline (auto-recovers from any glitch).
@@ -976,9 +1024,16 @@ class StreamProcess:
             source_cmd = self._build_source_feeder_cmd(
                 file_path, preset, extra_input_opts=input_opts
             )
-            return self._start_resilient_pipeline(source_cmd, rtmp_url)
+            return self._start_resilient_pipeline(
+                source_cmd, rtmp_url, secondary_rtmp_url, secondary_name
+            )
 
-        # Finite file: simple single-process pipeline
+        # Finite file: simple single-process pipeline (no failover/fan-out).
+        if secondary_rtmp_url:
+            self._append_log(
+                'Not: tek seferlik (loop kapali) dosya yayininda ikincil hedef '
+                'desteklenmiyor; sadece birincil hedefe gonderilecek.'
+            )
         self.mode = 'simple'
         self.source_input_url = file_path
         cmd = [
@@ -997,7 +1052,8 @@ class StreamProcess:
         return self._start_simple_pipeline(cmd)
 
     # ---------- Resilient pipeline ----------
-    def _start_resilient_pipeline(self, source_cmd, rtmp_url):
+    def _start_resilient_pipeline(self, source_cmd, rtmp_url,
+                                  secondary_rtmp_url=None, secondary_name=None):
         try:
             self.standby_video_path = ensure_standby_video(self.quality)
         except Exception as standby_error:
@@ -1014,6 +1070,8 @@ class StreamProcess:
         self.restart_attempts = 0
         self.source_restart_attempts = 0
         self.pusher_restart_attempts = 0
+        self.pusher2_restart_attempts = 0
+        self.pusher2_dropped_chunks = 0
         self.using_filler = False
         self.using_fallback = False
         self.failover_count = 0
@@ -1038,6 +1096,25 @@ class StreamProcess:
             self.last_error = err
             self.last_pusher_error = str(e)
             return False, err
+
+        # Optional secondary destination (e.g. TikTok). A failure to launch it
+        # must NOT abort the primary stream — log and carry on; the supervisor
+        # will keep retrying it on its own backoff.
+        if secondary_rtmp_url:
+            self.secondary_enabled = True
+            self.secondary_name = secondary_name or 'pusher2'
+            self.secondary_rtmp_url = secondary_rtmp_url
+            self._pusher2_cmd = self._build_pusher_cmd(secondary_rtmp_url)
+            self.pusher2_status = 'starting'
+            try:
+                self._launch_pusher2()
+            except Exception as e:
+                self.last_pusher2_error = str(e)
+                self.pusher2_status = 'down'
+                self._append_log(
+                    f'{self.secondary_name} pusher baslatilamadi: {e}',
+                    source=self.secondary_name
+                )
 
         try:
             self._launch_filler()
@@ -1093,6 +1170,60 @@ class StreamProcess:
             daemon=True
         ).start()
         self._append_log(f'Pusher baslatildi (pid: {self.pid})', source='pusher')
+
+    def _launch_pusher2(self):
+        """Launch the optional secondary pusher (same proven copy-to-RTMP
+        command as the primary, just a different destination)."""
+        if not self._pusher2_cmd:
+            raise RuntimeError('secondary pusher command not set')
+        label = self.secondary_name or 'pusher2'
+        proc = subprocess.Popen(
+            self._pusher2_cmd,
+            stdin=subprocess.PIPE,
+            stdout=subprocess.DEVNULL,
+            stderr=subprocess.PIPE,
+            bufsize=0
+        )
+        # Fresh queue per (re)launch so stale buffered bytes from a dead pusher
+        # are discarded rather than replayed into the new connection.
+        q = queue.Queue(maxsize=PUSHER2_QUEUE_MAX)
+        self.pusher2_proc = proc
+        self._pusher2_queue = q
+        self.pusher2_status = 'live'
+        threading.Thread(
+            target=self._pusher2_writer_loop, args=(proc, q),
+            name=f'{label}-w-{self.stream_id[:6]}', daemon=True
+        ).start()
+        threading.Thread(
+            target=self._consume_stderr, args=(proc, label), daemon=True
+        ).start()
+        self._append_log(f'{label} pusher baslatildi (pid: {proc.pid})', source=label)
+
+    def _pusher2_writer_loop(self, proc, q):
+        """Drain the secondary queue into the secondary pusher's stdin.
+
+        Runs on its own thread, so a slow/stalled secondary destination blocks
+        only here — never the relay. Exits when the process dies, its stdin
+        closes, or stop is requested.
+        """
+        stdin = proc.stdin
+        while not self.stop_event.is_set():
+            try:
+                chunk = q.get(timeout=0.5)
+            except queue.Empty:
+                if proc.poll() is not None:
+                    break
+                continue
+            if chunk is None:
+                break
+            try:
+                if stdin is None or stdin.closed:
+                    break
+                stdin.write(chunk)
+            except (BrokenPipeError, OSError, ValueError):
+                break
+            except Exception:
+                break
 
     def _launch_filler(self):
         if not self._filler_cmd:
@@ -1170,9 +1301,11 @@ class StreamProcess:
 
         next_source_restart_at = None
         next_pusher_restart_at = None
+        next_pusher2_restart_at = None
         next_filler_restart_at = None
         source_backoff = SOURCE_BACKOFF_INITIAL
         pusher_backoff = PUSHER_BACKOFF_INITIAL
+        pusher2_backoff = PUSHER_BACKOFF_INITIAL
         filler_backoff = SOURCE_BACKOFF_INITIAL
         last_active_label = None
 
@@ -1212,6 +1345,42 @@ class StreamProcess:
                         next_pusher_restart_at = now + timedelta(seconds=pusher_backoff)
                 # Fall through to keep reading feeders even while pusher is down;
                 # bytes will be discarded by the should_write check below.
+
+            # 1b) Same lifecycle for the optional secondary pusher (e.g.
+            #     TikTok), but fully independent: if it dies or its key expires
+            #     it restarts on its own backoff and never touches the primary
+            #     (YouTube) push.
+            if self.secondary_enabled:
+                label2 = self.secondary_name or 'pusher2'
+                pusher2_alive = self.pusher2_proc and self.pusher2_proc.poll() is None
+                if not pusher2_alive and not self.stop_event.is_set():
+                    if self.pusher2_proc is not None:
+                        code = self.pusher2_proc.poll()
+                        self._append_log(
+                            f'{label2} pusher dustu (kod: {code}), yeniden baglanacak',
+                            source=label2
+                        )
+                        self.pusher2_status = 'down'
+                        self.pusher2_restart_attempts += 1
+                        self.last_pusher2_error = f'exit code {code}'
+                        self._terminate_process(self.pusher2_proc, force=True)
+                        self.pusher2_proc = None
+                    if next_pusher2_restart_at is None:
+                        next_pusher2_restart_at = now + timedelta(seconds=pusher2_backoff)
+                    elif now >= next_pusher2_restart_at:
+                        try:
+                            self._launch_pusher2()
+                            pusher2_backoff = PUSHER_BACKOFF_INITIAL
+                            next_pusher2_restart_at = None
+                        except Exception as e:
+                            self.last_pusher2_error = str(e)
+                            self._append_log(f'{label2} pusher baslatilamadi: {e}', source=label2)
+                            pusher2_backoff = min(pusher2_backoff * 2, PUSHER_BACKOFF_MAX)
+                            next_pusher2_restart_at = now + timedelta(seconds=pusher2_backoff)
+                elif pusher2_alive:
+                    next_pusher2_restart_at = None
+                    pusher2_backoff = PUSHER_BACKOFF_INITIAL
+                    self.pusher2_status = 'live'
 
             # 2) Ensure filler is alive (deferred restart with backoff so a
             #    persistent filler failure doesn't hot-loop).
@@ -1412,6 +1581,17 @@ class StreamProcess:
                         f'Pusher yazma hatasi: {write_error}',
                         source='supervisor'
                     )
+
+                # Fan the same active bytes out to the secondary pusher through
+                # its drop-on-full queue. This never blocks the relay: if the
+                # secondary destination falls behind we drop its chunks and the
+                # primary (YouTube) push is unaffected.
+                if (self.secondary_enabled and self._pusher2_queue is not None
+                        and self.pusher2_proc is not None):
+                    try:
+                        self._pusher2_queue.put_nowait(chunk)
+                    except queue.Full:
+                        self.pusher2_dropped_chunks += 1
 
             if broken_pusher:
                 self._terminate_process(self.pusher_proc, force=False)
@@ -1631,6 +1811,12 @@ class StreamProcess:
                         pusher.stdin.close()
                     except Exception:
                         pass
+                pusher2 = self.pusher2_proc
+                if pusher2 and pusher2.stdin and not pusher2.stdin.closed:
+                    try:
+                        pusher2.stdin.close()
+                    except Exception:
+                        pass
                 try:
                     sup.join(timeout=6)
                 except Exception:
@@ -1688,6 +1874,15 @@ class StreamProcess:
                     except Exception:
                         pass
         self.pusher_proc = None
+        pusher2 = self.pusher2_proc
+        if pusher2:
+            try:
+                if pusher2.stdin and not pusher2.stdin.closed:
+                    pusher2.stdin.close()
+            except Exception:
+                pass
+            self._terminate_process(pusher2, force=True)
+        self.pusher2_proc = None
         self.pid = None
         if not quiet:
             self._append_log('Pipeline temizlendi')
@@ -1927,6 +2122,10 @@ def start_stream():
     stream_type = data.get('type')
     youtube_key = data.get('youtube_key', '').strip()
     quality = data.get('quality', '1080p')
+    secondary_rtmp = build_secondary_rtmp_url(
+        data.get('tiktok_url'), data.get('tiktok_key')
+    )
+    secondary_name = 'tiktok' if secondary_rtmp else None
 
     if not youtube_key:
         return jsonify({'success': False, 'error': 'YouTube Stream Key is required'}), 400
@@ -1938,7 +2137,10 @@ def start_stream():
         m3u8_url = data.get('m3u8_url', '').strip()
         if not m3u8_url:
             return jsonify({'success': False, 'error': 'M3U8 URL is required'}), 400
-        success, message = stream.start_m3u8(m3u8_url, youtube_key, quality)
+        success, message = stream.start_m3u8(
+            m3u8_url, youtube_key, quality,
+            secondary_rtmp_url=secondary_rtmp, secondary_name=secondary_name
+        )
 
     elif stream_type == 'file':
         # For file upload, we expect the file to be uploaded separately
@@ -1947,7 +2149,10 @@ def start_stream():
             return jsonify({'success': False, 'error': 'File not found. Please upload first.'}), 400
 
         loop = data.get('loop', False)
-        success, message = stream.start_file(uploaded_files[file_id]['path'], youtube_key, quality, loop)
+        success, message = stream.start_file(
+            uploaded_files[file_id]['path'], youtube_key, quality, loop,
+            secondary_rtmp_url=secondary_rtmp, secondary_name=secondary_name
+        )
 
     else:
         return jsonify({'success': False, 'error': 'Invalid stream type'}), 400
@@ -2069,6 +2274,12 @@ def stream_status(stream_id):
         'youtube_title': stream.youtube_title,
         'youtube_uploader': stream.youtube_uploader,
         'youtube_channel_url': stream.youtube_channel_url,
+        'secondary_enabled': stream.secondary_enabled,
+        'secondary_name': stream.secondary_name,
+        'pusher2_status': stream.pusher2_status,
+        'pusher2_restart_attempts': stream.pusher2_restart_attempts,
+        'pusher2_dropped_chunks': stream.pusher2_dropped_chunks,
+        'last_pusher2_error': stream.last_pusher2_error,
     })
 
 
@@ -2473,6 +2684,9 @@ def iptv_start_stream():
     channel_name = data.get('channel_name', 'IPTV Channel')
     youtube_key = data.get('youtube_key', '').strip()
     quality = data.get('quality', '1080p')
+    secondary_rtmp = build_secondary_rtmp_url(
+        data.get('tiktok_url'), data.get('tiktok_key')
+    )
 
     if not channel_url:
         return jsonify({'success': False, 'error': 'Channel URL is required'}), 400
@@ -2484,7 +2698,11 @@ def iptv_start_stream():
     stream = StreamProcess(stream_id)
 
     # Use the existing M3U8 streaming method - IPTV channels are typically M3U8/TS streams
-    success, message = stream.start_m3u8(channel_url, youtube_key, quality)
+    success, message = stream.start_m3u8(
+        channel_url, youtube_key, quality,
+        secondary_rtmp_url=secondary_rtmp,
+        secondary_name='tiktok' if secondary_rtmp else None
+    )
 
     if success:
         active_streams[stream_id] = stream
@@ -2562,6 +2780,9 @@ def youtube_start_stream():
     youtube_url = data.get('youtube_url', '').strip()
     youtube_key = data.get('youtube_key', '').strip()
     quality = data.get('quality', '1080p')
+    secondary_rtmp = build_secondary_rtmp_url(
+        data.get('tiktok_url'), data.get('tiktok_key')
+    )
 
     if not youtube_url:
         return jsonify({'success': False, 'error': 'YouTube URL gerekli'}), 400
@@ -2572,7 +2793,11 @@ def youtube_start_stream():
     stream_id = str(uuid.uuid4())
     stream = StreamProcess(stream_id)
 
-    success, message = stream.start_youtube(youtube_url, youtube_key, quality)
+    success, message = stream.start_youtube(
+        youtube_url, youtube_key, quality,
+        secondary_rtmp_url=secondary_rtmp,
+        secondary_name='tiktok' if secondary_rtmp else None
+    )
 
     if success:
         active_streams[stream_id] = stream
@@ -2580,7 +2805,7 @@ def youtube_start_stream():
         return jsonify({
             'success': True,
             'stream_id': stream_id,
-            'message': 'YouTube restream başlatıldı'
+            'message': 'YouTube restream başlatıldı' + (' + TikTok' if secondary_rtmp else '')
         })
     else:
         return jsonify({'success': False, 'error': message}), 500
