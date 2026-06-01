@@ -67,7 +67,20 @@ STANDBY_LOCK = threading.Lock()
 STANDBY_CACHE = {}
 
 SOURCE_DATA_TIMEOUT_SECONDS = float(os.environ.get('SOURCE_DATA_TIMEOUT', '2.5'))
-SOURCE_STALL_TIMEOUT_SECONDS = float(os.environ.get('SOURCE_STALL_TIMEOUT', '8.0'))
+SOURCE_STALL_TIMEOUT_SECONDS = float(os.environ.get('SOURCE_STALL_TIMEOUT', '12.0'))
+# Initial warm-up grace BEFORE the source emits its first byte. A live YouTube
+# HLS feeder must fetch the manifest, download the first segments and prime the
+# x264 encoder, which routinely takes longer than the mid-stream stall budget.
+# Killing it too early traps the stream permanently on the standby feed.
+SOURCE_START_TIMEOUT_SECONDS = float(os.environ.get('SOURCE_START_TIMEOUT', '30.0'))
+# How long a resolved YouTube (googlevideo) URL is trusted before a restart
+# triggers a fresh yt-dlp resolve. These URLs stay valid for hours, so reusing
+# the cached command on transient restarts avoids stalling the relay with a
+# blocking yt-dlp round-trip on every flap.
+YT_URL_REFRESH_SECONDS = float(os.environ.get('YT_URL_REFRESH_SECONDS', '1800'))
+# Force a fresh resolve after this many consecutive restart attempts even if the
+# cached URL is still "young" (covers streams whose tokens expire early).
+YT_REFRESH_AFTER_RESTARTS = int(os.environ.get('YT_REFRESH_AFTER_RESTARTS', '3'))
 SOURCE_BACKOFF_INITIAL = float(os.environ.get('SOURCE_BACKOFF_INITIAL', '1.0'))
 SOURCE_BACKOFF_MAX = float(os.environ.get('SOURCE_BACKOFF_MAX', '20.0'))
 PUSHER_BACKOFF_INITIAL = float(os.environ.get('PUSHER_BACKOFF_INITIAL', '1.0'))
@@ -337,6 +350,9 @@ class StreamProcess:
         self._pusher_cmd = []
         self._filler_cmd = []
         self._source_cmd = []
+        # Restart-attempt count at the last YouTube re-resolve; used to gate how
+        # often the supervisor pays for a blocking yt-dlp refresh.
+        self._last_resolve_restart_count = 0
 
         # Threading
         # Thread safety in resilient mode relies on the invariant that the
@@ -378,16 +394,39 @@ class StreamProcess:
         """
         is_live = bool(info.get('is_live'))
 
+        def _is_m3u8_fmt(fmt):
+            url = fmt.get('url') or ''
+            proto = (fmt.get('protocol') or '').lower()
+            return bool(url) and ('m3u8' in proto or '.m3u8' in url.lower())
+
         if is_live:
-            # For live, the master HLS manifest is the right thing to give FFmpeg
+            # 1) Prefer the format yt-dlp's selector already chose. With
+            #    download=False yt-dlp still applies the format string and sets
+            #    info['url'] to the best m3u8 <=1080p variant.
+            direct_proto = (info.get('protocol') or '').lower()
+            direct = info.get('url')
+            if direct and ('m3u8' in direct_proto or '.m3u8' in direct.lower()):
+                return direct
+            # 2) Otherwise pick the BEST HLS variant by resolution/bitrate.
+            #    yt-dlp lists formats worst-first, so the previous code returned
+            #    the lowest quality (sometimes audio-only) playlist, which made
+            #    the video map empty and the restream effectively dead.
+            m3u8_formats = [f for f in (info.get('formats') or []) if _is_m3u8_fmt(f)]
+            video_m3u8 = [
+                f for f in m3u8_formats
+                if f.get('vcodec') and f.get('vcodec') != 'none'
+            ]
+            candidates = video_m3u8 or m3u8_formats
+            if candidates:
+                candidates.sort(
+                    key=lambda f: ((f.get('height') or 0), (f.get('tbr') or 0)),
+                    reverse=True
+                )
+                return candidates[0]['url']
+            # 3) Fall back to the master manifest if one is exposed.
             manifest = info.get('manifest_url')
             if manifest:
                 return manifest
-            for fmt in (info.get('formats') or []):
-                url = fmt.get('url') or ''
-                proto = (fmt.get('protocol') or '').lower()
-                if 'm3u8' in proto or '.m3u8' in url.lower():
-                    return url
 
         direct_url = info.get('url')
         if direct_url:
@@ -550,6 +589,13 @@ class StreamProcess:
             parsed = urlparse(source_url)
             if not parsed.scheme or not parsed.netloc:
                 return None
+            host = (parsed.hostname or '').lower()
+            # YouTube's googlevideo CDN doesn't need a Referer/Origin and can
+            # answer 403 when it sees a spoofed one. Send nothing for these.
+            if (host.endswith('googlevideo.com')
+                    or host.endswith('youtube.com')
+                    or host.endswith('ytimg.com')):
+                return None
             origin = f'{parsed.scheme}://{parsed.netloc}'
             referer = source_url
             return f'Referer: {referer}\r\nOrigin: {origin}\r\n'
@@ -568,15 +614,23 @@ class StreamProcess:
         source_url,
         compatibility=False,
         cookie_header=None,
-        hls_tuning=False
+        hls_tuning=False,
+        live=False
     ):
         """Build FFmpeg input options for network streams."""
-        options = [
-            '-re',
+        options = []
+        # -re throttles the input to realtime. A LIVE source (HLS segments or a
+        # continuous TS feed) is already paced at 1x by the upstream, so adding
+        # -re only makes FFmpeg lag behind the live edge until segments expire,
+        # which manifests as the source never producing data and the stream
+        # being stuck on the standby feed. Use -re only for non-live (VOD).
+        if not live:
+            options.append('-re')
+        options.extend([
             '-thread_queue_size', '2048',
             '-user_agent', DEFAULT_INPUT_USER_AGENT,
             '-protocol_whitelist', 'file,http,https,tcp,tls,crypto'
-        ]
+        ])
         headers = self._build_source_headers(source_url)
         if headers:
             options.extend(['-headers', headers])
@@ -810,7 +864,8 @@ class StreamProcess:
             self.source_input_url,
             compatibility=False,
             cookie_header=self.source_cookies,
-            hls_tuning=True
+            hls_tuning=True,
+            live=True
         )
 
         source_cmd = self._build_source_feeder_cmd(
@@ -872,7 +927,8 @@ class StreamProcess:
         self.source_input_url = input_url
 
         input_options = self._build_network_input_options(
-            input_url, compatibility=False, hls_tuning=hls_tuning
+            input_url, compatibility=False, hls_tuning=hls_tuning,
+            live=self.youtube_is_live
         )
         source_cmd = self._build_source_feeder_cmd(
             input_url, preset, extra_input_opts=input_options
@@ -1174,10 +1230,16 @@ class StreamProcess:
                 if self.last_source_data_at:
                     idle = (now - self.last_source_data_at).total_seconds()
                     source_data_fresh = idle < SOURCE_DATA_TIMEOUT_SECONDS
+                    stall_limit = SOURCE_STALL_TIMEOUT_SECONDS
                 else:
+                    # No byte yet: the feeder is still warming up (manifest +
+                    # segment fetch + x264 priming). Give it a much longer grace
+                    # window so we don't kill a healthy source mid-startup and
+                    # trap the stream on the standby feed forever.
                     idle = (now - self.source_launched_at).total_seconds() if self.source_launched_at else 0
+                    stall_limit = SOURCE_START_TIMEOUT_SECONDS
                 # Kill stalled source so the restart loop can revive it
-                if idle > SOURCE_STALL_TIMEOUT_SECONDS:
+                if idle > stall_limit:
                     self._append_log(
                         f'Kaynak {idle:.0f}s veri uretmedi, yeniden baglatilacak',
                         source='supervisor'
@@ -1382,7 +1444,8 @@ class StreamProcess:
             self.source_input_url = input_url
             input_options = self._build_network_input_options(
                 input_url, compatibility=False,
-                cookie_header=self.source_cookies, hls_tuning=hls_tuning
+                cookie_header=self.source_cookies, hls_tuning=hls_tuning,
+                live=True
             )
             preset = self._get_preset(self.quality)
             self._source_cmd = self._build_source_feeder_cmd(
@@ -1392,6 +1455,28 @@ class StreamProcess:
             return
         if self.source_type != 'youtube':
             return
+
+        # Re-resolving YouTube is a blocking yt-dlp round-trip that, while it
+        # runs, stops the supervisor from relaying the standby feed too (so even
+        # the failover gaps). googlevideo URLs stay valid for hours, so for a
+        # transient restart we keep the cached command and recover instantly.
+        # Only pay for a fresh resolve when the URL is genuinely old or several
+        # consecutive restarts suggest the cached URL has actually died.
+        age = None
+        if self.youtube_resolved_at:
+            age = (datetime.now() - self.youtube_resolved_at).total_seconds()
+        attempts_since = self.source_restart_attempts - self._last_resolve_restart_count
+        if (self._source_cmd
+                and age is not None
+                and age < YT_URL_REFRESH_SECONDS
+                and attempts_since < YT_REFRESH_AFTER_RESTARTS):
+            self._append_log(
+                f'YouTube URL hala gecerli ({age:.0f}s), onbellekten yeniden baglaniyor',
+                source='supervisor'
+            )
+            return
+        self._last_resolve_restart_count = self.source_restart_attempts
+
         resolved = self._resolve_youtube_source(self.source)
         if not resolved.get('success'):
             err = resolved.get('error') or 'unknown'
@@ -1423,7 +1508,8 @@ class StreamProcess:
         )
         self.source_input_url = input_url
         input_options = self._build_network_input_options(
-            input_url, compatibility=False, hls_tuning=hls_tuning
+            input_url, compatibility=False, hls_tuning=hls_tuning,
+            live=self.youtube_is_live
         )
         preset = self._get_preset(self.quality)
         self._source_cmd = self._build_source_feeder_cmd(
