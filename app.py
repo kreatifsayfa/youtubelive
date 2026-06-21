@@ -2811,6 +2811,85 @@ def youtube_start_stream():
         return jsonify({'success': False, 'error': message}), 500
 
 
+def _autostart_runner(url, key, quality, secondary, secondary_name, lock_path):
+    """Background worker that brings up the preconfigured stream, retrying until
+    the source (e.g. a live broadcast that may not be on yet at boot) is up."""
+    max_tries = int(os.environ.get('AUTOSTART_MAX_TRIES', '30'))
+    retry_delay = float(os.environ.get('AUTOSTART_RETRY_DELAY', '20'))
+    time.sleep(float(os.environ.get('AUTOSTART_DELAY', '8')))
+    attempt = 0
+    while True:
+        attempt += 1
+        try:
+            stream_id = str(uuid.uuid4())
+            stream = StreamProcess(stream_id)
+            ok, msg = stream.start_youtube(
+                url, key, quality,
+                secondary_rtmp_url=secondary, secondary_name=secondary_name
+            )
+            if ok:
+                active_streams[stream_id] = stream
+                try:
+                    save_stream_state(active_streams)
+                except Exception:
+                    pass
+                print(f'[autostart] yayin basladi: {msg}', flush=True)
+                return
+            print(f'[autostart] deneme {attempt} basarisiz: {msg}', flush=True)
+        except Exception as e:
+            print(f'[autostart] deneme {attempt} hata: {e}', flush=True)
+        if max_tries and attempt >= max_tries:
+            print('[autostart] maksimum deneme asildi, vazgecildi', flush=True)
+            try:
+                os.remove(lock_path)  # allow a later boot to retry
+            except Exception:
+                pass
+            return
+        time.sleep(retry_delay)
+
+
+def maybe_autostart():
+    """Optionally start a preconfigured stream on boot for unattended deploys.
+
+    Driven purely by env vars so NO stream key lives in the (public) repo:
+      AUTOSTART_ENABLED, AUTOSTART_YOUTUBE_URL, AUTOSTART_YOUTUBE_KEY,
+      AUTOSTART_QUALITY, AUTOSTART_TIKTOK_URL, AUTOSTART_TIKTOK_KEY.
+    An atomic lock file makes it run at most once per container even across
+    multiple gunicorn workers or a worker restart (no duplicate streams).
+    """
+    enabled = os.environ.get('AUTOSTART_ENABLED', 'false').strip().lower() == 'true'
+    url = os.environ.get('AUTOSTART_YOUTUBE_URL', '').strip()
+    key = os.environ.get('AUTOSTART_YOUTUBE_KEY', '').strip()
+    if not enabled or not url or not key:
+        return
+    quality = (os.environ.get('AUTOSTART_QUALITY', '1080p').strip() or '1080p')
+    secondary = build_secondary_rtmp_url(
+        os.environ.get('AUTOSTART_TIKTOK_URL'),
+        os.environ.get('AUTOSTART_TIKTOK_KEY')
+    )
+    lock_path = os.path.join(tempfile.gettempdir(), 'youtubelive_autostart.lock')
+    try:
+        fd = os.open(lock_path, os.O_CREAT | os.O_EXCL | os.O_WRONLY)
+        os.write(fd, str(os.getpid()).encode())
+        os.close(fd)
+    except FileExistsError:
+        return  # another worker / earlier boot already owns autostart
+    except Exception:
+        return
+    print('[autostart] etkin, yayin hazirlaniyor...', flush=True)
+    threading.Thread(
+        target=_autostart_runner,
+        args=(url, key, quality, secondary,
+              'tiktok' if secondary else None, lock_path),
+        name='autostart', daemon=True
+    ).start()
+
+
+# Run on import so it fires under gunicorn (module imported per worker) as well
+# as `python app.py`. No-ops unless AUTOSTART_* env vars are configured.
+maybe_autostart()
+
+
 if __name__ == '__main__':
     port = int(os.environ.get('PORT', 5000))
     debug = os.environ.get('FLASK_DEBUG', 'false').lower() == 'true'
