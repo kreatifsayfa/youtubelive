@@ -2885,7 +2885,8 @@ def youtube_start_stream():
         return jsonify({'success': False, 'error': message}), 500
 
 
-def _autostart_runner(url, key, quality, secondary, secondary_name, lock_path):
+def _autostart_runner(source_type, source, key, quality, secondary,
+                      secondary_name, lock_path):
     """Background worker that brings up the preconfigured stream, retrying until
     the source (e.g. a live broadcast that may not be on yet at boot) is up."""
     max_tries = int(os.environ.get('AUTOSTART_MAX_TRIES', '30'))
@@ -2897,17 +2898,23 @@ def _autostart_runner(url, key, quality, secondary, secondary_name, lock_path):
         try:
             stream_id = str(uuid.uuid4())
             stream = StreamProcess(stream_id)
-            ok, msg = stream.start_youtube(
-                url, key, quality,
-                secondary_rtmp_url=secondary, secondary_name=secondary_name
-            )
+            if source_type == 'm3u8':
+                ok, msg = stream.start_m3u8(
+                    source, key, quality,
+                    secondary_rtmp_url=secondary, secondary_name=secondary_name
+                )
+            else:
+                ok, msg = stream.start_youtube(
+                    source, key, quality,
+                    secondary_rtmp_url=secondary, secondary_name=secondary_name
+                )
             if ok:
                 active_streams[stream_id] = stream
                 try:
                     save_stream_state(active_streams)
                 except Exception:
                     pass
-                print(f'[autostart] yayin basladi: {msg}', flush=True)
+                print(f'[autostart] yayin basladi ({source_type}): {msg}', flush=True)
                 return
             print(f'[autostart] deneme {attempt} basarisiz: {msg}', flush=True)
         except Exception as e:
@@ -2926,27 +2933,33 @@ def maybe_autostart():
     """Optionally start a preconfigured stream on boot for unattended deploys.
 
     Driven purely by env vars so NO stream key lives in the (public) repo:
-      AUTOSTART_ENABLED, AUTOSTART_YOUTUBE_URL, AUTOSTART_YOUTUBE_KEY,
+      AUTOSTART_ENABLED, AUTOSTART_YOUTUBE_KEY (destination),
+      AUTOSTART_M3U8_URL or AUTOSTART_YOUTUBE_URL (source; M3U8 preferred),
       AUTOSTART_QUALITY, AUTOSTART_TIKTOK_URL, AUTOSTART_TIKTOK_KEY.
     An atomic lock file makes it run at most once per container even across
     multiple gunicorn workers or a worker restart (no duplicate streams).
     """
-    url = os.environ.get('AUTOSTART_YOUTUBE_URL', '').strip()
     key = os.environ.get('AUTOSTART_YOUTUBE_KEY', '').strip()
-    # Explicit off-switch only; otherwise the presence of BOTH url and key is
-    # the signal to start. This way it works even if only Dokploy env vars
-    # (not the repo's nixpacks [variables]) reach the running container, and it
-    # logs exactly why it skipped so misconfig is obvious in the deploy logs.
+    m3u8_url = os.environ.get('AUTOSTART_M3U8_URL', '').strip()
+    yt_url = os.environ.get('AUTOSTART_YOUTUBE_URL', '').strip()
+    # Explicit off-switch only; otherwise a destination key + any source is the
+    # signal to start. Logs exactly why it skipped so misconfig is obvious.
     if os.environ.get('AUTOSTART_ENABLED', '').strip().lower() == 'false':
         print('[autostart] AUTOSTART_ENABLED=false -> atlandi', flush=True)
         return
-    if not url or not key:
-        print(
-            f'[autostart] atlandi: URL={"VAR" if url else "YOK"}, '
-            f'KEY={"VAR" if key else "YOK"} (ikisi de gerekli)',
-            flush=True
-        )
+    if not key:
+        print('[autostart] atlandi: AUTOSTART_YOUTUBE_KEY yok (hedef anahtar)', flush=True)
         return
+    if not (m3u8_url or yt_url):
+        print('[autostart] atlandi: kaynak yok '
+              '(AUTOSTART_M3U8_URL veya AUTOSTART_YOUTUBE_URL gerekli)', flush=True)
+        return
+    # Prefer a direct M3U8 source: it needs no yt-dlp, so it sidesteps YouTube's
+    # bot/cookie wall that blocks extraction from datacenter IPs.
+    if m3u8_url:
+        source_type, source = 'm3u8', m3u8_url
+    else:
+        source_type, source = 'youtube', yt_url
     quality = (os.environ.get('AUTOSTART_QUALITY', '1080p').strip() or '1080p')
     secondary = build_secondary_rtmp_url(
         os.environ.get('AUTOSTART_TIKTOK_URL'),
@@ -2961,10 +2974,10 @@ def maybe_autostart():
         return  # another worker / earlier boot already owns autostart
     except Exception:
         return
-    print('[autostart] etkin, yayin hazirlaniyor...', flush=True)
+    print(f'[autostart] etkin ({source_type}), yayin hazirlaniyor...', flush=True)
     threading.Thread(
         target=_autostart_runner,
-        args=(url, key, quality, secondary,
+        args=(source_type, source, key, quality, secondary,
               'tiktok' if secondary else None, lock_path),
         name='autostart', daemon=True
     ).start()
