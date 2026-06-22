@@ -6,7 +6,11 @@ nixPkgs = ["python312", "python312Packages.pip", "ffmpeg-full"]
 
 [phases.install]
 cmds = [
-  "pip3 install --no-cache-dir --break-system-packages -r requirements.txt"
+  "pip3 install --no-cache-dir --break-system-packages -r requirements.txt",
+  # YouTube changes constantly, so always install the freshest yt-dlp (nightly)
+  # at build time. Without this an old cached build fails with "No video
+  # formats found". Editing this list also busts the build cache.
+  "pip3 install --no-cache-dir --break-system-packages -U --pre yt-dlp"
 ]
 
 [phases.build]
