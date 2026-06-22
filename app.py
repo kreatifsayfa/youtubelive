@@ -15,6 +15,7 @@ import threading
 import queue
 import time
 import json
+import base64
 import tempfile
 from collections import deque
 from datetime import datetime, timedelta
@@ -294,6 +295,60 @@ def build_secondary_rtmp_url(server_url, stream_key):
     return server_url.rstrip('/') + '/' + stream_key.lstrip('/')
 
 
+_YTDLP_COOKIE_CACHE = {'path': None, 'resolved': False}
+_YTDLP_COOKIE_LOCK = threading.Lock()
+
+
+def get_ytdlp_cookiefile():
+    """Return a path to a yt-dlp cookies file if configured, else None.
+
+    YouTube blocks yt-dlp from datacenter/VPS IPs with "Sign in to confirm
+    you're not a bot" unless authenticated. Supplying cookies from a logged-in
+    session fixes it. Sources (first match wins):
+      YTDLP_COOKIES_FILE - path to an existing Netscape cookies.txt
+      YTDLP_COOKIES_B64  - base64 of a cookies.txt (best for one-line env vars)
+      YTDLP_COOKIES      - raw cookies.txt contents
+    The content is written once to a private temp file and cached for reuse.
+    """
+    with _YTDLP_COOKIE_LOCK:
+        if _YTDLP_COOKIE_CACHE['resolved']:
+            return _YTDLP_COOKIE_CACHE['path']
+        path = None
+        explicit = os.environ.get('YTDLP_COOKIES_FILE', '').strip()
+        if explicit and os.path.exists(explicit):
+            path = explicit
+        else:
+            content = None
+            b64 = os.environ.get('YTDLP_COOKIES_B64', '').strip()
+            raw = os.environ.get('YTDLP_COOKIES', '')
+            if b64:
+                try:
+                    content = base64.b64decode(b64).decode('utf-8', 'replace')
+                except Exception as e:
+                    print(f'[cookies] YTDLP_COOKIES_B64 cozulemedi: {e}', flush=True)
+            elif raw.strip():
+                content = raw
+            if content:
+                try:
+                    cdir = os.path.join(tempfile.gettempdir(), 'youtubelive_cookies')
+                    os.makedirs(cdir, exist_ok=True)
+                    cpath = os.path.join(cdir, 'youtube_cookies.txt')
+                    with open(cpath, 'w', encoding='utf-8') as f:
+                        f.write(content)
+                    try:
+                        os.chmod(cpath, 0o600)
+                    except Exception:
+                        pass
+                    path = cpath
+                except Exception as e:
+                    print(f'[cookies] cookie dosyasi yazilamadi: {e}', flush=True)
+        _YTDLP_COOKIE_CACHE['path'] = path
+        _YTDLP_COOKIE_CACHE['resolved'] = True
+        if path:
+            print('[cookies] yt-dlp icin cookie dosyasi etkin', flush=True)
+        return path
+
+
 class StreamProcess:
     """Resilient YouTube streamer.
 
@@ -566,20 +621,33 @@ class StreamProcess:
 
         target = cls._normalize_youtube_url(youtube_url)
 
+        # Player clients are overridable: on a flagged datacenter IP, trying
+        # clients like "android,ios,tv" (without "web") sometimes dodges the
+        # bot check, but supplying cookies is the reliable fix.
+        clients_env = os.environ.get('YTDLP_PLAYER_CLIENTS', '').strip()
+        player_clients = (
+            [c.strip() for c in clients_env.split(',') if c.strip()]
+            if clients_env else ['default', 'web', 'android', 'ios']
+        )
+
         ydl_opts = {
             'format': 'best[protocol*=m3u8][height<=?1080]/best[height<=?1080]/best',
             'quiet': True,
             'no_warnings': True,
             'skip_download': True,
             'noplaylist': True,
-            # Allow newer YouTube clients yt-dlp knows about
             'extractor_args': {
-                'youtube': {'player_client': ['default', 'web', 'android', 'ios']},
+                'youtube': {'player_client': player_clients},
             },
             # Cap network calls so the supervisor thread can't be wedged
             # by a hung extract_info during a YouTube URL refresh.
             'socket_timeout': float(os.environ.get('YTDLP_SOCKET_TIMEOUT', '15')),
         }
+
+        # Cookies authenticate yt-dlp so YouTube stops bot-blocking the server.
+        cookiefile = get_ytdlp_cookiefile()
+        if cookiefile:
+            ydl_opts['cookiefile'] = cookiefile
 
         try:
             with yt_dlp.YoutubeDL(ydl_opts) as ydl:
@@ -587,6 +655,12 @@ class StreamProcess:
         except Exception as e:
             msg = str(e)
             lowered = msg.lower()
+            if 'not a bot' in lowered or 'sign in to confirm' in lowered:
+                return {'success': False, 'error': (
+                    'YouTube sunucu IP-sini bot olarak engelledi. Cozum: '
+                    'YTDLP_COOKIES_B64 ortam degiskenine giris yapmis bir '
+                    'YouTube hesabinin cookie-lerini ekleyin.'
+                )}
             if 'private' in lowered:
                 return {'success': False, 'error': 'Video gizli (private). Erisim yok.'}
             if 'members-only' in lowered or 'members only' in lowered:
@@ -2857,10 +2931,21 @@ def maybe_autostart():
     An atomic lock file makes it run at most once per container even across
     multiple gunicorn workers or a worker restart (no duplicate streams).
     """
-    enabled = os.environ.get('AUTOSTART_ENABLED', 'false').strip().lower() == 'true'
     url = os.environ.get('AUTOSTART_YOUTUBE_URL', '').strip()
     key = os.environ.get('AUTOSTART_YOUTUBE_KEY', '').strip()
-    if not enabled or not url or not key:
+    # Explicit off-switch only; otherwise the presence of BOTH url and key is
+    # the signal to start. This way it works even if only Dokploy env vars
+    # (not the repo's nixpacks [variables]) reach the running container, and it
+    # logs exactly why it skipped so misconfig is obvious in the deploy logs.
+    if os.environ.get('AUTOSTART_ENABLED', '').strip().lower() == 'false':
+        print('[autostart] AUTOSTART_ENABLED=false -> atlandi', flush=True)
+        return
+    if not url or not key:
+        print(
+            f'[autostart] atlandi: URL={"VAR" if url else "YOK"}, '
+            f'KEY={"VAR" if key else "YOK"} (ikisi de gerekli)',
+            flush=True
+        )
         return
     quality = (os.environ.get('AUTOSTART_QUALITY', '1080p').strip() or '1080p')
     secondary = build_secondary_rtmp_url(
