@@ -968,6 +968,29 @@ class StreamProcess:
         ]
 
     # ---------- Public start_* methods ----------
+    def _resolve_auto_quality(self, input_url):
+        """For quality='auto': probe the source's native height with ffprobe and
+        pick a matching preset (no wasteful upscaling), capped at 1080p to
+        protect CPU. Falls back to 720p when probing fails — which is also the
+        safe low-CPU default, so 'auto' can only help or land on 720p."""
+        height = None
+        try:
+            out = subprocess.run(
+                ['ffprobe', '-v', 'error', '-select_streams', 'v:0',
+                 '-show_entries', 'stream=height', '-of', 'csv=p=0', input_url],
+                capture_output=True, text=True, timeout=20
+            )
+            for line in (out.stdout or '').splitlines():
+                digits = ''.join(c for c in line if c.isdigit())
+                if digits:
+                    height = int(digits)
+                    break
+        except Exception as e:
+            self._append_log(f'AUTO kalite: ffprobe basarisiz ({e}); 720p kullanilacak')
+        chosen = '1080p' if (height and height >= 1080) else '720p'
+        self._append_log(f'AUTO kalite -> {chosen} (kaynak yuksekligi: {height or "?"})')
+        return chosen
+
     def start_m3u8(self, m3u8_url, youtube_key, quality='1080p',
                    secondary_rtmp_url=None, secondary_name=None):
         """Start streaming from M3U8 URL to YouTube (resilient mode)."""
@@ -991,6 +1014,9 @@ class StreamProcess:
             resolved_url, self.source_cookies, session_key=self.stream_id
         )
 
+        if str(quality).lower() == 'auto':
+            quality = self._resolve_auto_quality(self.source_input_url)
+        self.quality = quality
         preset = self._get_preset(quality)
         rtmp_url = f"rtmp://a.rtmp.youtube.com/live2/{youtube_key}"
 
@@ -1042,6 +1068,9 @@ class StreamProcess:
             f'(kanal: {self.youtube_uploader or "?"})'
         )
 
+        if str(quality).lower() == 'auto':
+            quality = self._resolve_auto_quality(stream_url)
+        self.quality = quality
         preset = self._get_preset(quality)
         rtmp_url = f"rtmp://a.rtmp.youtube.com/live2/{youtube_key}"
         hls_tuning = self._is_hls_url(stream_url)
@@ -1086,6 +1115,10 @@ class StreamProcess:
         self.quality = quality
         self.loop_file = loop
         self.auto_restart = bool(loop)
+
+        if str(quality).lower() == 'auto':
+            quality = self._resolve_auto_quality(file_path)
+            self.quality = quality
 
         rtmp_url = f"rtmp://a.rtmp.youtube.com/live2/{youtube_key}"
         bitrate = self._get_bitrate(quality)

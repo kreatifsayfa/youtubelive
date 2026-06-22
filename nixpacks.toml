@@ -31,4 +31,6 @@ PYTHONUNBUFFERED = "1"
 # AUTOSTART_TIKTOK_KEY) as environment variables in Dokploy instead.
 AUTOSTART_ENABLED = "true"
 AUTOSTART_YOUTUBE_URL = "https://www.youtube.com/watch?v=bNY8a2BB5Gc"
-AUTOSTART_QUALITY = "1080p"
+# "auto" probes the source and matches its resolution (no wasteful upscaling),
+# capped at 1080p; falls back to 720p. Set 720p/1080p/etc. to force.
+AUTOSTART_QUALITY = "auto"
